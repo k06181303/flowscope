@@ -2,7 +2,7 @@
 
 > **用途:** SPEC 的資料需求 → FinMind dataset 的完整對照。Step 2 起實作資料層時依此建 provider。
 > **地位:** 本文件為**查證紀錄與實作對照**,不取代 SPEC。與 SPEC 衝突時,以 SPEC + `PROGRESS.md` 的人類裁定為準。
-> **查證日:** 2026-08-18
+> **查證日:** 2026-08-18(文件查證)/ 2026-08-19(API 實測,見 §6)
 > **來源:** FinMind 官方文件 <https://finmind.github.io/tutor/TaiwanMarket/DataList/>
 
 ---
@@ -16,9 +16,10 @@
 | 禁止 | **絕不寫入 YAML config**。SPEC §9.1 的 `config_snapshot` 會把整份 config 明文寫進每次執行的 `manifest.json` |
 | 缺 token 行為 | 啟動即中止並報錯。不得降級為「無資料繼續跑」 |
 | manifest 記錄 | 只記錄 token 是否存在,**不記錄值** |
-| 方案層級 | Phase 1 需要 **Backer / Sponsor** 層(見 §2 標註)|
+| 方案層級 | **Backer($699/月)即足夠**。已於 2026-08-19 實測 17 個 dataset 全部可存取。$999 多的是券商分點/分K/即時報價,SPEC §4.4 明列分點 Phase 1 不實作,且本系統為日頻批次,均用不到 |
+| 速率限制 | Backer 層 1,600 req/hr。**必須採「按日期批次下載」而非「按股票逐檔查詢」**,否則單一 dataset 回補 1,800 檔就會撞牆 |
 
-速率限制:免費層約 600 requests/hour。所有 provider 必須先查本地 Parquet 快取(SPEC §4.3),避免重複請求。
+所有 provider 必須先查本地 Parquet 快取(SPEC §4.3),避免重複請求。
 
 ---
 
@@ -27,7 +28,7 @@
 | SPEC 需求 | Dataset | API function | 起始日 | 層級 |
 |---|---|---|---|---|
 | OHLCV 原始價 | `TaiwanStockPrice` | `taiwan_stock_daily()` | 1994-10-01 | 免費 |
-| **還原股價** | `TaiwanStockPriceAdj` | `taiwan_stock_daily_adj()` | 1994-10-01 | **Sponsor** |
+| **還原股價** | `TaiwanStockPriceAdj` | `taiwan_stock_daily_adj()` | 1994-10-01 | **Backer** |
 | 三大法人買賣超 | `TaiwanStockInstitutionalInvestorsBuySell` | `taiwan_stock_institutional_investors()` | 2005-01-01 | 免費 |
 | 融資融券 | `TaiwanStockMarginPurchaseShortSale` | `taiwan_stock_margin_purchase_short_sale()` | 2001-01-01 | 免費 |
 | 借券餘額 | `TaiwanStockSecuritiesLending` | `taiwan_stock_securities_lending()` | 2001-05-01 | 免費 |
@@ -38,7 +39,7 @@
 | 現金流量表 | `TaiwanStockCashFlowsStatement` | `taiwan_stock_cash_flows_statement()` | 2008-06-01 | 免費 |
 | 股利政策 | `TaiwanStockDividend` | `taiwan_stock_dividend()` | 2005-05-01 | 免費 |
 | 除權除息結果 | `TaiwanStockDividendResult` | `taiwan_stock_dividend_result()` | 2003-05-01 | 免費 |
-| 市值(Altman X4) | `TaiwanStockMarketValue` | `taiwan_stock_market_value()` | 2004-01-01 | **Sponsor** |
+| 市值(Altman X4) | `TaiwanStockMarketValue` | `taiwan_stock_market_value()` | 2004-01-01 | **Backer** |
 | 下市櫃清單 | `TaiwanStockDelisting` | `taiwan_stock_delisting()` | 2001-01-01 | 免費 |
 | 台股總覽 + 產業別 | `TaiwanStockInfo` | `taiwan_stock_info()` | 2021-10-05 | 免費 |
 | 加權/櫃買報酬指數(T05 基準) | `TaiwanStockTotalReturnIndex` | `taiwan_stock_total_return_index()` | 2003-01-01 | 免費 |
@@ -81,6 +82,15 @@ SPEC §4.1 要求所有資料經 `publish_date <= as_of` 過濾。FinMind 各 da
 | 月營收 | 營收月份 | 次月 10 日前公告,須用實際公告日或保守推估 |
 | **財報三表** | **財報期別(季末)**,**不是**公布日 | 須推導。Review Protocol §2.1:若用推估,**Q4 為 +75 天**而非 +45 天 |
 
+**財報公布日已實測確認不存在。** 2026-08-19 實際呼叫 `TaiwanStockFinancialStatements` 回傳欄位僅有:
+`date`, `origin_name`, `stock_id`, `type`, `value` —— 沒有任何 publish / announce / release 欄位。
+
+兩個推論:
+1. `publish_date` **必須自行推導**,Q4 用 +75 天。這是 Phase 1 最大的 PIT 風險點
+2. 財報是 **long format**(`type`/`value` 成對),Altman Z / Beneish M 的輸入需先 pivot 成寬表
+
+這也是 TEJ 相對 FinMind 唯一實質的優勢(TEJ 有正式公布日欄位)。是否升級,待 Phase 1 產出前進紀錄後再評估。
+
 **還原股價的 PIT 陷阱(Review Protocol §2.1 稱為「最陰險的一種洩漏」):** `TaiwanStockPriceAdj` 由 FinMind 以**最新**除權息資訊回算。若直接取用,歷史價格會隱含未來的除權息資訊。實作時必須確認還原基準日不晚於 `as_of`,或改以原始價 + `TaiwanStockDividendResult` 自行做 backward adjustment。**此點必須在 Step 2 以 SPEC 的兩次取價比對法驗證。**
 
 ---
@@ -90,13 +100,46 @@ SPEC §4.1 要求所有資料經 `publish_date <= as_of` 過濾。FinMind 各 da
 各資料源起始日不同,系統的完整可用起點由**最晚**者決定:
 
 ```
-資產負債表  2011-12-01   ← 最晚,Altman Z 需要
-集保分散表  2010-01-29
-三大法人    2005-01-01
-融資融券    2001-01-01
+集保「週頻」     2016-01      ← 最晚,決定整體起點(見下)
+資產負債表       2011-12-01
+集保「月頻」     2010-01-29
+三大法人         2005-01-01
+融資融券         2001-01-01
 ```
 
-**結論:L0 + L1 + 完整籌碼因子皆可用的最早 `as_of` 約為 2012 年初。** 早於此日期的執行會有維度缺失,須由 §10.3 啟動自我檢查攔截,不得靜默以 `fill_value: 0.5` 帶過。
+**結論:實際可用的最早 `as_of` 為 2016 年初,不是 2012。** 理由見下節的集保頻率實測。
+
+早於此日期的執行會有維度缺失或因子語意錯誤,須由 §10.3 啟動自我檢查攔截,**不得靜默以 `fill_value: 0.5` 帶過**。
+
+---
+
+## 4.1 ⚠️ 集保資料頻率在 2016 年改變(實測結果)
+
+2026-08-19 以 2330 實測 `TaiwanStockHoldingSharesPer` 各年 Q1:
+
+| 年份 | Q1 資料日數 | 級距數 | 頻率 |
+|---|---|---|---|
+| 2010 | 3 | 16 | **月頻**(每月最後營業日)|
+| 2013 | 3 | 16 | 月頻 |
+| 2014 | 3 | 16 | 月頻 |
+| 2015 | 3 | 16 | 月頻 |
+| **2016** | **11** | 16 | **週頻** ← 轉折點 |
+| 2018 | 13 | 16 | 週頻 |
+| 2020 | 13 | **17** | 週頻 |
+| 2024 | 13 | **17** | 週頻 |
+
+**對 C05 的影響(重要):** `chips.params.C05` 的 `slope_weeks: 8` 與 `zscore_weeks: 52` 都假設**週頻**。
+若 `as_of` 落在 2016 年之前,同樣的視窗長度實際涵蓋的是 8 個月與 52 個月,
+因子語意完全不同,但程式不會報錯——這是典型的「看起來能跑但結果是錯的」。
+
+**實作要求:**
+- 資料層必須偵測實際頻率,而非假設週頻
+- `as_of < 2016-01-01` 時,C05 應回傳 `null` 或明確降級並記錄,不得靜默沿用週頻參數
+- §10.3 啟動自我檢查應納入「集保資料頻率符合預期」一項
+
+**對級距數的影響:** 級距數由 16 增為 17(2018–2020 間變動)。
+這正是 SPEC §6.2 改以**股數下界**判定、不寫死 tier 序號的實證依據——
+若寫死序號,跨期資料必然錯位。
 
 ---
 
@@ -113,6 +156,27 @@ SPEC §4.1 要求所有資料經 `publish_date <= as_of` 過濾。FinMind 各 da
 
 欄位:`date`, `stock_id`, `HoldingSharesLevel`, `people`, `percent`, `unit`
 → 對應 SPEC §4.3 的 `data_date`, `symbol`, `tier`, `holder_count`, `share_pct`, `share_count`
+
+---
+
+## 6. 實測驗證紀錄
+
+**驗證日:2026-08-19**,工具:`scripts/check_finmind_access.py`
+
+| 項目 | 結果 |
+|---|---|
+| 17 個 Phase 1 dataset 權限 | **全部 [OK]**,Backer($699/月)層即足夠 |
+| 集保最早可得日期 | **2010-01-29**,與官方文件一致 |
+| 集保頻率 | 2016 年起週頻,之前月頻(見 §4.1)|
+| 集保級距數 | 16 → 17(2018–2020 間變動)|
+| 財報是否含公布日 | **否**,僅 `date`(期別)/`origin_name`/`stock_id`/`type`/`value` |
+
+**尚未驗證(留待 Step 2,列為 blocking):**
+
+1. **還原股價是否有 PIT 洩漏** —— 依 Review Protocol §2.1 的兩次取價比對法。
+   `TaiwanStockPriceAdj` 由 FinMind 以最新除權息資訊回算,直接取用極可能洩漏。
+2. **`shares_outstanding` 雙推導是否一致** —— G1,見 §2。
+3. **按日期批次下載是否涵蓋所有需要的 dataset** —— 影響回補可行性。
 
 ---
 
