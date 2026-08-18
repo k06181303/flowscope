@@ -89,10 +89,129 @@ output: {formats: [parquet, json, markdown], include_raw_factor_values: true}
     assert config_hash(load_config(first)) == config_hash(load_config(second))
 
 
+def test_config_hash_is_independent_of_enabled_order(tmp_path: Path) -> None:
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    first.write_text(content, encoding="utf-8")
+    second.write_text(
+        content.replace(
+            "enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]",
+            "enabled: [T21, T19, T18, T15, T13, T11, T10, T05, T03, T02, T01]",
+        ),
+        encoding="utf-8",
+    )
+
+    assert config_hash(load_config(first)) == config_hash(load_config(second))
+
+
+def test_config_hash_changes_when_enabled_factor_set_changes(tmp_path: Path) -> None:
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    first.write_text(content, encoding="utf-8")
+    second.write_text(
+        content.replace(
+            "enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]",
+            "enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19]",
+        ),
+        encoding="utf-8",
+    )
+
+    assert config_hash(load_config(first)) != config_hash(load_config(second))
+
+
 def test_invalid_weight_sum_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "bad.yaml"
     content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
     path.write_text(content.replace("financial: 0.20", "financial: 0.21"), encoding="utf-8")
 
     with pytest.raises(ValidationError, match="weights.dimensions must sum to 1.0"):
+        load_config(path)
+
+
+def test_enabled_factor_ids_must_be_known_for_dimension(tmp_path: Path) -> None:
+    path = tmp_path / "bad_enabled.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    path.write_text(
+        content.replace(
+            "enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]",
+            "enabled: [T99, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="unknown IDs: T99"):
+        load_config(path)
+
+
+def test_enabled_factor_ids_must_match_dimension_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "wrong_dimension.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    path.write_text(
+        content.replace(
+            "enabled: [M01, M02, M03, M04]",
+            "enabled: [M01, M02, M03, C01]",
+        ).replace("M04: { ma_months: 3 }", "M03: { ma_months: 3 }"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="unknown IDs: C01"):
+        load_config(path)
+
+
+def test_enabled_factor_ids_must_not_repeat(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_enabled.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    path.write_text(
+        content.replace(
+            "enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]",
+            "enabled: [T01, T02, T02, T05, T10, T11, T13, T15, T18, T19, T21]",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="duplicate IDs: T02"):
+        load_config(path)
+
+
+def test_enabled_factor_ids_must_not_be_empty(tmp_path: Path) -> None:
+    path = tmp_path / "empty_enabled.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    path.write_text(
+        content.replace(
+            "enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]",
+            "enabled: []",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="enabled list must not be empty"):
+        load_config(path)
+
+
+def test_factor_params_must_belong_to_enabled_factors(tmp_path: Path) -> None:
+    path = tmp_path / "bad_params.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    path.write_text(
+        content.replace("T02: { window: 60 }", "T99: { window: 60 }"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="not enabled: T99"):
+        load_config(path)
+
+
+def test_distribution_warning_reject_must_exceed_flag(tmp_path: Path) -> None:
+    path = tmp_path / "bad_distribution_warning.yaml"
+    content = Path("configs/tw_swing.yaml").read_text(encoding="utf-8")
+    path.write_text(
+        content.replace("distribution_warning_reject: 3", "distribution_warning_reject: 2"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="distribution_warning_reject must be greater than distribution_warning_flag",
+    ):
         load_config(path)

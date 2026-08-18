@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from collections import Counter
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator
 
@@ -8,6 +9,9 @@ Market = Literal["TW"]
 Horizon = Literal["swing"]
 OutputFormat = Literal["parquet", "json", "markdown"]
 HolderMode = Literal["composite"]
+TECHNICAL_FACTOR_IDS = frozenset(f"T{index:02d}" for index in range(1, 22))
+CHIPS_FACTOR_IDS = frozenset(f"C{index:02d}" for index in range(1, 18))
+THEME_FACTOR_IDS = frozenset(f"M{index:02d}" for index in range(1, 6))
 
 
 class StrictModel(BaseModel):
@@ -50,10 +54,15 @@ class PostScoreGateConfig(StrictModel):
     distribution_warning_flag: int = Field(ge=0)
 
     @model_validator(mode="after")
-    def validate_atr_range(self) -> PostScoreGateConfig:
+    def validate_post_score_gates(self) -> PostScoreGateConfig:
         low, high = self.atr_pct_range
         if low >= high:
             raise ValueError("post_score.atr_pct_range must be ascending")
+        if self.distribution_warning_reject <= self.distribution_warning_flag:
+            raise ValueError(
+                "post_score.distribution_warning_reject must be greater than "
+                "distribution_warning_flag"
+            )
         return self
 
 
@@ -82,18 +91,53 @@ class WeightsConfig(StrictModel):
 
 
 class FactorGroupConfig(StrictModel):
+    allowed_factor_ids: ClassVar[frozenset[str]] = frozenset()
+
     enabled: list[str]
     params: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_enabled(self) -> FactorGroupConfig:
+        if not self.enabled:
+            raise ValueError("factor enabled list must not be empty")
+        counts = Counter(self.enabled)
+        duplicates = sorted(factor_id for factor_id, count in counts.items() if count > 1)
+        if duplicates:
+            joined = ", ".join(duplicates)
+            raise ValueError(f"factor enabled list contains duplicate IDs: {joined}")
+        unknown_ids = sorted(set(self.enabled) - self.allowed_factor_ids)
+        if unknown_ids:
+            joined = ", ".join(unknown_ids)
+            raise ValueError(f"factor enabled list contains unknown IDs: {joined}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_params_enabled_subset(self) -> FactorGroupConfig:
+        unknown_keys = sorted(set(self.params) - set(self.enabled))
+        if unknown_keys:
+            joined = ", ".join(unknown_keys)
+            raise ValueError(f"factor params contain keys that are not enabled: {joined}")
+        return self
+
+
+class TechnicalFactorGroupConfig(FactorGroupConfig):
+    allowed_factor_ids: ClassVar[frozenset[str]] = TECHNICAL_FACTOR_IDS
+
 
 class ChipsFactorGroupConfig(FactorGroupConfig):
+    allowed_factor_ids: ClassVar[frozenset[str]] = CHIPS_FACTOR_IDS
+
     holder_mode: HolderMode
 
 
+class ThemeFactorGroupConfig(FactorGroupConfig):
+    allowed_factor_ids: ClassVar[frozenset[str]] = THEME_FACTOR_IDS
+
+
 class FactorsConfig(StrictModel):
-    technical: FactorGroupConfig
+    technical: TechnicalFactorGroupConfig
     chips: ChipsFactorGroupConfig
-    theme: FactorGroupConfig
+    theme: ThemeFactorGroupConfig
 
 
 class MissingScoringConfig(StrictModel):
