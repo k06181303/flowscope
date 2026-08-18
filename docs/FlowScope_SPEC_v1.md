@@ -5,6 +5,18 @@
 
 ---
 
+## 修訂紀錄
+
+| 日期 | 節次 | 修訂內容 | 依據 |
+|---|---|---|---|
+| 2026-08-18 | §4.3、§4.4、§13 Step 3 | 集保股權分散表改由 FinMind `TaiwanStockHoldingSharesPer` 取得;集保官網爬蟲降級為 Phase 2 備援 | 使用者裁定(§14-2 選項 A)。FinMind 該 dataset 自 2010-01-29 起,集保官網僅保留約 1 年 |
+| 2026-08-18 | §6.2 | 集保級距改以**股數下界**判定,不再依賴 tier 編號 | 原表 tier 編號與集保官方差 1,且與同節 `retail_pct = tier 1..3` 自相矛盾 |
+| 2026-08-18 | §8.5 | 取消台股整張(1000 股)限制,允許零股 | 使用者裁定(§14-1) |
+
+詳細查證見 `docs/FinMind_API_Inventory.md`;人類裁定紀錄見 `PROGRESS.md`。
+
+---
+
 ## 0. 專案身分與邊界
 
 ### 0.1 這是一個全新的獨立專案
@@ -227,7 +239,8 @@ class ChipProvider(Protocol):
         """集保股權分散表。
         symbol, data_date, publish_date, tier, holder_count,
         share_count, share_pct
-        tier 為級距代碼 1..15 (1-999股 ... 1000張以上)"""
+        tier 為級距**股數下界**(如 400001 代表 400,001–600,000 股區間)。
+        *(2026-08-18 修訂)* 不使用集保 tier 序號,理由見 §6.2"""
         ...
 
 class FundamentalProvider(Protocol):
@@ -250,7 +263,7 @@ class MetaProvider(Protocol):
 | 資料 | 來源 | 備註 |
 |---|---|---|
 | OHLCV、三大法人、融資券、月營收、財報 | **FinMind 贊助方案** | 主要來源 |
-| 集保股權分散表 | **集保結算所公開網站爬蟲** | 免費。歷史資料僅約 3 年,需及早開始每週自行存檔 |
+| 集保股權分散表 | **FinMind `TaiwanStockHoldingSharesPer`** | *(2026-08-18 修訂)* 自 2010-01-29 起,需 Backer/Sponsor 層。集保官網僅保留約 1 年,爬蟲降級為 Phase 2 備援,Phase 1 不實作 |
 | 處置股/注意股 | TWSE / TPEx 公告頁 | |
 | 券商分點 | **Phase 1 不實作** | 成本高、處理複雜。介面預留,先驗證免費資料的有效性 |
 
@@ -530,25 +543,36 @@ value = 1 if 高點與低點皆抬升 (HH + HL)
 
 #### 集保股權分散表衍生因子
 
-集保級距對照(`tier` 欄位):
+集保級距對照 *(2026-08-18 修訂)*:
 
-| tier | 級距 |
-|---|---|
-| 1–5 | 1–999 股 ~ 50,000 股 |
-| 11 | 400,001–600,000 股 |
-| 12 | 600,001–800,000 股 |
-| 13 | 800,001–1,000,000 股 |
-| 14 | 1,000,001 股以上 |
-| 15 | 合計 |
+**本節一律以「級距的股數下界」判定,不使用集保 tier 序號。** 原規格表列的 tier 編號與集保官方編號相差 1(官方 tier 12 才是 400,001–600,000 股),且與本節 `retail_pct = tier 1..3` 的用法自相矛盾。FinMind `TaiwanStockHoldingSharesPer` 的 `HoldingSharesLevel` 本就是字串區間(如 `"400001-600000"`),解析下界比較即可,不需依賴任何編號。
 
-定義:
+集保官方級距(供對照,**實作不得寫死序號**):
+
+| 官方 tier | 級距(股) | | 官方 tier | 級距(股) |
+|---|---|---|---|---|
+| 1 | 1–999 | | 9 | 50,001–100,000 |
+| 2 | 1,000–5,000 | | 10 | 100,001–200,000 |
+| 3 | 5,001–10,000 | | 11 | 200,001–400,000 |
+| 4 | 10,001–15,000 | | 12 | 400,001–600,000 |
+| 5 | 15,001–20,000 | | 13 | 600,001–800,000 |
+| 6 | 20,001–30,000 | | 14 | 800,001–1,000,000 |
+| 7 | 30,001–40,000 | | 15 | 1,000,001 以上 |
+| 8 | 40,001–50,000 | | 合計 | (須排除,不得計入加總) |
+
+定義(以股數下界 `lower` 判定):
 ```
-big_holder_pct   = tier 11..14 的 share_pct 加總   (400 張以上)
-mega_holder_pct  = tier 14 的 share_pct            (1000 張以上)
-retail_pct       = tier 1..3 的 share_pct          (10 張以下)
-retail_count     = tier 1..3 的 holder_count 加總
+big_holder_pct   = Σ share_pct where lower >= 400_001      (400 張以上)
+mega_holder_pct  = Σ share_pct where lower >= 1_000_001    (1000 張以上)
+retail_pct       = Σ share_pct where lower <= 5_001        (10 張以下)
+retail_count     = Σ holder_count where lower <= 5_001
 avg_shares_held  = 總股數 / 總股東人數
 ```
+
+**實作要求:**
+- 「合計」列必須明確排除,不得混入任何加總
+- 各級距 `share_pct` 加總應 ≈ 100%(容忍 0.5%),不符者標記
+- 集保若新增或調整級距,以股數下界判定的邏輯不受影響——這正是不寫死序號的理由
 
 **C01 `big_holder_slope`** — **最重要的單一籌碼因子**
 ```
@@ -960,7 +984,7 @@ max_position_pct     預設 15%
 risk_amount    = account_value × risk_per_trade_pct / 100
 shares_by_risk = risk_amount / risk_per_share
 shares_by_cap  = account_value × max_position_pct / 100 / entry_mid
-position_shares = floor(min(shares_by_risk, shares_by_cap) / 1000) × 1000   # 台股整張
+position_shares = floor(min(shares_by_risk, shares_by_cap))   # (2026-08-18 修訂) 允許零股
 若 position_shares == 0 → 記錄 "position_too_small",保留計畫但標記
 ```
 
@@ -1275,7 +1299,7 @@ flowscope report run --run-id 20260818T163000Z-a3f9c1
 |---|---|---|
 | 1 | 專案骨架、config schema、CLI 空殼 | `flowscope --help` 可執行;mypy strict 通過 |
 | 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 可取得任一股票 3 年還原日線;`test_pit.py` 通過 |
-| 3 | **集保爬蟲 + 解析 + PIT 對齊** | 可取得任一股票 2 年週頻股權分散;`publish_date` 正確設定為 `data_date + 7d` 並對齊交易日 |
+| 3 | **集保 provider (FinMind) + 解析 + PIT 對齊** | *(2026-08-18 修訂)* 可取得任一股票 2 年週頻股權分散;`publish_date` 正確設定為 `data_date + 7d` 並對齊交易日。**PIT 要求不變**,僅資料來源由爬蟲改為 FinMind |
 | 4 | Universe + L0/L1 Gate + 漏斗輸出 | 輸出 §5.3 格式的漏斗;各關剩餘檔數合理 |
 | 5 | 技術面因子 T01–T21 | 每個因子有 golden fixture 測試;共線性報告可產出 |
 | 6 | **籌碼面因子 C01–C17** | 同上;C15/C16 型態因子有正負樣本各 3 組 fixture |

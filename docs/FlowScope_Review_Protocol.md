@@ -75,7 +75,7 @@ grep -rn "publish_date" src/flowscope/ | wc -l
 # 若少於因子數量,幾乎確定有直接繞過的路徑
 
 # 檢查 2: 集保 publish_date 設定
-grep -rn -A5 "publish_date" src/flowscope/data/providers/tdcc.py
+grep -rn -A5 "publish_date" src/flowscope/data/providers/finmind.py   # (2026-08-18) 集保改由 FinMind 取得
 
 # 檢查 3: 是否有讀 parquet 後未過濾就用
 grep -rn "read_parquet\|scan_parquet" src/ 
@@ -202,7 +202,7 @@ grep -rn -A2 "except" src/flowscope/ | grep -iE "pass$|continue$|return None$|re
 - [ ] 資料抓取失敗會拋出或明確記錄,不是靜默回傳空 DataFrame
 - [ ] **爬蟲失敗時不得回傳空結果讓流程繼續跑**——這會讓整個籌碼維度變成 0.5 填充值,而漏斗看起來一切正常
 
-這一條對 TDCC 爬蟲特別重要。集保網站改版或擋爬時,系統必須**中止並報錯**,不是安靜地產出一份沒有籌碼訊號的名單。
+這一條對集保資料特別重要。*(2026-08-18 修訂:集保改由 FinMind `TaiwanStockHoldingSharesPer` 取得)* FinMind 回傳空集合、權限不足(`Your level is register`)或請求超限時,系統必須**中止並報錯**,不是安靜地產出一份沒有籌碼訊號的名單。
 
 ### 2.8 殘留的假資料
 
@@ -232,16 +232,20 @@ adj_close[除權日-1] / adj_close[除權日] ≈ 1 (誤差 < 1%)
 raw_close[除權日-1] / raw_close[除權日] > 1 (有跳空)
 ```
 
-### Step 3 — 集保爬蟲(**關鍵路徑**)
+### Step 3 — 集保資料層(**關鍵路徑**)
 
-- [ ] 原始 HTML/CSV 有存到 `data/raw/tdcc/{data_date}/`
-- [ ] tier 級距對照與 SPEC §6.2 一致(特別是 tier 11–14 = 400 張以上)
+*(2026-08-18 修訂:資料來源由集保官網爬蟲改為 FinMind `TaiwanStockHoldingSharesPer`。PIT 要求完全不變。)*
+
+- [ ] 原始 API 回應有存到 `data/raw/tdcc/{data_date}/`(保留原始回應,不可只存解析結果)
+- [ ] **級距以股數下界判定,不得寫死 tier 序號**(SPEC §6.2 修訂版)。`big_holder_pct` 取 `lower >= 400_001`,`retail_pct` 取 `lower <= 5_001`
+- [ ] 「合計」列有明確排除,未混入任何加總
+- [ ] FinMind 權限不足或超限時中止並報錯,不得回傳空集合
 - [ ] `share_pct` 各級距加總 ≈ 100%(容忍 0.5% 誤差);不符者應標記
-- [ ] rate limit ≥ 1 秒,有 retry with backoff
+- [ ] 有 rate limit 與 retry with backoff(FinMind 免費層約 600 req/hr,贊助層較高)
 - [ ] **`publish_date` 正確**(見 §2.1)
 - [ ] 週頻資料對齊到日頻時,用的是 forward fill 且不跨越 `publish_date`
 
-**手動驗算:** 取任一檔股票近 3 週的 `big_holder_pct`,對照集保官網原始頁面確認數字一致。
+**手動驗算:** 取任一檔股票近 3 週的 `big_holder_pct`,對照集保官網原始頁面確認數字一致(集保官網保留約 1 年,近期資料仍可對照)。
 
 ### Step 4 — Universe & Gate
 
@@ -362,7 +366,7 @@ raw_close[除權日-1] / raw_close[除權日] > 1 (有跳空)
 3. `test_factors_chips.py` 裡的期望值是怎麼算出來的?
 4. 橫斷面百分位的 group by 是什麼欄位?
 5. 若我把 `T02.window` 從 60 改成 30,Top 30 名單會變嗎?你驗證過嗎?
-6. TDCC 爬蟲失敗時系統會怎樣?會中止還是繼續?
+6. 集保資料抓取失敗(FinMind 權限不足/超限/回空)時系統會怎樣?會中止還是繼續?
 7. C16 `distribution_warning` 實作在哪一層?
 8. 兩次執行同一個 as_of,輸出檔案 hash 相同嗎?
 9. 你有跳過 SPEC 的哪些部分?為什麼?
@@ -379,7 +383,7 @@ raw_close[除權日-1] / raw_close[除權日] > 1 (有跳空)
 | 情境 | 偵測方式 |
 |---|---|
 | 籌碼因子全部回傳 null,被填成 0.5,系統退化成純技術選股 | 檢查 `candidates.parquet` 的 chips 因子 raw_value 有幾成是 null |
-| TDCC 只爬到最近 1 週,`big_holder_slope` 全部 null | 檢查 `data/raw/tdcc/` 有幾個日期目錄 |
+| 集保只取到最近 1 週,`big_holder_slope` 全部 null | 檢查 `data/raw/tdcc/` 有幾個日期目錄;FinMind 應可回溯至 2010-01-29 |
 | 財務排雷用了 mock 資料 | 檢查 L1 刷掉的檔數與名單合理性 |
 | 產業分類全部是 "Unknown" | 檢查 M01–M03 的分母 |
 | 交易日曆用「排除週末」,遇到台股補班日/颱風假就錯位 | 檢查是否有台灣國定假日資料來源 |

@@ -38,14 +38,24 @@ DoD:`flowscope --help` 可執行;`mypy src --strict` 通過
 
 ## 待人類決定(對應 SPEC §14)
 
-| # | 事項 | 狀態 | 決定 |
+| # | 事項 | 狀態 | 決定(2026-08-18 由使用者裁定) |
 |---|---|---|---|
-| 1 | 帳戶規模 `account.value` | 待決 | |
-| 2 | 集保歷史深度(是否接受從現在開始累積) | 待決 | |
-| 3 | 下市股票清單來源(FinMind 是否提供) | 待決 | |
-| 4 | 產業分類(TWSE 官方 vs 自訂主題) | 待決 | |
-| 5 | 是否納入興櫃 | 預設排除 | |
-| 6 | `top_n` 是否為 30 | 預設 30 | |
+| 1 | 帳戶規模 `account.value` | **已決定** | `account.value = 1,000,000`(NT$),使用者確認為實際可交易金額。並**允許零股**:SPEC §8.5 的 `floor(.../1000)×1000` 整張限制取消(SPEC 已於 2026-08-18 修訂) |
+| 2 | 集保歷史深度 | **已決定(選項 A)** | **改用 FinMind `TaiwanStockHoldingSharesPer` 取得集保股權分散表**(2010-01-29 起,Backer/Sponsor 層)。集保官網爬蟲降級為 Phase 2 備援,不在 Phase 1 實作。SPEC §4.4 與 §13 Step 3 需依此修訂 |
+| 3 | 下市股票清單來源 | **已決定** | 使用 FinMind `TaiwanStockDelisting`(2001-01-01 起,免費層)。**不接受倖存者偏差**,universe 必須納入已下市股票 |
+| 4 | 產業分類 | **已決定** | Phase 1 使用 TWSE 官方分類(來源 `TaiwanStockInfo` 的產業別欄位)。自訂主題分類延後,不在 Phase 1 |
+| 5 | 是否納入興櫃 | **已決定** | 排除。維持 config `gates.l0.exclude_markets: [EMERGING]` |
+| 6 | `top_n` 是否為 30 | **已決定** | 維持 30 |
+| 7 | 憑證管理(SPEC 未涵蓋,新增) | **已決定** | FinMind token 走環境變數 `FINMIND_TOKEN`,本機以 `.env` 載入(已加入 `.gitignore`)。**絕不得寫入 YAML config**——SPEC §9.1 的 `config_snapshot` 會將整份 config 明文寫入 manifest。缺 token 時啟動即中止並報錯,不得降級繼續 |
+| 8 | SPEC §6.2 集保 tier 編號錯誤(新增) | **已決定** | SPEC 原表 tier 編號與集保官方差 1,且與同節 `retail_pct = tier 1..3` 自相矛盾。**SPEC §6.2 已於 2026-08-18 修訂**:改以級距的**股數下界**判定(`big_holder_pct` 取 `lower >= 400_001`、`retail_pct` 取 `lower <= 5_001`),不再依賴任何 tier 序號,「合計」列須排除 |
+| 9 | **G1** `shares_outstanding` FinMind 無對應 dataset | **已決定** | **雙推導交叉驗證**:(a) `TaiwanStockBalanceSheet` 普通股股本 ÷ 面額 10 元;(b) `TaiwanStockMarketValue` ÷ 收盤價。兩者差異超出容忍範圍時**報錯**,不得任選其一靜默使用。PIT 要求:取 `as_of` 當時的值,不是最新值 |
+| 10 | **G2** 會計師意見 FinMind 無資料 | **已決定** | **Phase 1 不實作**,明確記錄為已知缺口。L1 的「會計師意見非無保留 → 排除」該條停用,不得以任何預設值假裝有跑 |
+| 11 | **G3** 財報延遲申報 FinMind 無直接欄位 | **已決定** | **另尋 TWSE 來源**(公開資訊觀測站)。在來源接上前,該條 L1 停用並記錄 |
+| 12 | **G4** 董監質押比 FinMind 無資料 | **已決定** | **Phase 1 不實作**,明確記錄為已知缺口。該條原本即為「標記」而非「排除」,影響較小 |
+| 13 | **G5** 注意股 / 全額交割股 FinMind 僅有處置股 | **已決定** | 處置股用 `TaiwanStockDispositionSecuritiesPeriod`;注意股與全額交割股**另尋 TWSE / TPEx 來源**。在來源接上前,L1 僅攔截處置股並記錄缺口 |
+
+> **G2/G4 的副作用(審查時必讀):** L1 少掉兩條排除條件,實際攔截檔數會低於 SPEC §5.2 預期的 50–150 檔。
+> 這是已知且已接受的缺口,**不得為了把數字湊回預期區間而放寬其他 L1 門檻**——那違反 SPEC §15 第 8 條。
 
 ---
 

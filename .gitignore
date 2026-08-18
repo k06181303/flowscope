@@ -14,3 +14,8 @@ data/runs/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/runs/.gitkeep
+
+# 憑證：FinMind token 等一律走環境變數，絕不進版控
+.env
+.env.*
+!.env.example
