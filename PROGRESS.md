@@ -6,9 +6,9 @@
 
 ## 目前狀態
 
-**Step 2 完成。**
+**Step 2 CONDITIONAL 補修完成,待審查複核。**
 
-下一步:SPEC §13 **Step 3 — 集保 provider (FinMind) + 解析 + PIT 對齊**
+下一步:審查通過後進入 SPEC §13 **Step 3 — 集保 provider (FinMind) + 解析 + PIT 對齊**
 
 DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 
@@ -19,7 +19,7 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | Step | 內容 | 完成日 | DoD 達成 | Commit |
 |---|---|---|---|---|
 | 1 | 專案骨架、config schema、CLI 空殼 | 2026-08-18 | 是 | `step-1: initialize project skeleton` |
-| 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer` |
+| 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer`;`step-2: fix FinMind batching safeguards` |
 
 ---
 
@@ -37,6 +37,8 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | 2 | 集保股權分散 provider (`TaiwanStockHoldingSharesPer`) 與級距解析 | SPEC §13 修訂版將集保列為 Step 3；本步不得提前做 | 是，Step 3 補做 |
 | 2 | `MetaProvider.get_listings()` 的完整 PIT 股票池重建 | Step 2 聚焦資料取得、快取、交易日曆與還原價；`TaiwanStockInfo` 快照配合下市清單重建 universe 屬 Step 4 | 是，Step 4 補做 |
 | 2 | TWSE / TPEx 注意股、全額交割股補充來源 | Step 2 僅接 FinMind 資料層；PROGRESS #13 已裁定缺口需另尋官方來源 | 是，Step 4 L1 gate 前補做 |
+| 2 | `symbol_map.parquet` 未建立 | SPEC §4.2 #3 要求記錄符號變更與合併映射；Step 2 尚未接到可驗證的官方符號事件來源，建立空表會讓歷史 symbol 對齊看似完成 | 是，Step 4 universe/PIT listings 重建前補做 |
+| 2 | `securities_lending_balance` 目前回傳 `null` | `TaiwanStockSecuritiesLending` 免費層可取得，但實測欄位是借券交易明細，不是日末餘額；無期初餘額時不得把區間淨額偽造成 balance | 是，使用此欄位前需決定可驗證餘額來源或長歷史重建方法 |
 
 ---
 
@@ -73,6 +75,8 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | 1 | `flowscope.exe` 安裝於 user Scripts 目錄，但該目錄目前不在系統 `PATH` | 直接在新 shell 執行 `flowscope` 可能找不到命令；本次以臨時加入 `%APPDATA%\Python\Python313\Scripts` 驗證 entry point | 已記錄 |
 | 2 | 還原股價 `TaiwanStockPriceAdj` 由 FinMind 以最新除權息回算,**疑似 PIT 洩漏** | 所有技術面因子 | Step 2 已處理:探測顯示不同 `end_date` 的重疊區間報酬率相同,但 API 無歷史 `as_of` 快照可證明基準日；正式 provider 不採用 `TaiwanStockPriceAdj`,改用原始價 + `TaiwanStockDividendResult` 且還原事件截止日不晚於查詢 `end/as_of` |
 | 3 | 集保頻率 2016 年前為月頻 | C05 及整個籌碼維度 | 見待決表 #14,實際可用起點暫定 2016-01 |
+| 4 | SPEC §4.2 第 1 點寫「還原以最新價為基準」,與 Review Protocol §2.1 將最新基準列為 PIT 洩漏風險相矛盾 | 還原價實作依據與後續審查口徑 | 待人類修訂 SPEC §4.2；Step 2 provider 已採用正確做法:原始價 + `TaiwanStockDividendResult` 自行 backward adjustment,且除權息事件截止日不得晚於 `as_of` |
+| 5 | 全市場回補時間受 FinMind Backer 1,600 req/hr 限制 | 初次建置資料湖與 `--no-cache` 大範圍重抓 | 粗估 3 年全市場 Step 2 來源約 11,900 requests、至少 7.5 小時:日頻 bulk 4 個 dataset 約 2,920 requests/1.8 小時；財報三表逐檔約 5,400 requests/3.4 小時；股利與月營收逐檔約 3,600 requests/2.3 小時。實際時間會因重試、限流與快取命中率增加或減少 |
 
 ---
 
@@ -81,3 +85,4 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | 日期 | Step | 判定 | 主要 blocking 項 |
 |---|---|---|---|
 | 2026-08-18 | 1 | CONDITIONAL | 需補跳過揭露、factor params 驗證、distribution warning 門檻驗證 |
+| 2026-08-19 | 2 | CONDITIONAL | 需補多檔逐日期抓取、財報逐檔抓取、法人欄位改名防呆、借券餘額揭露、SPEC §4.2 矛盾揭露 |

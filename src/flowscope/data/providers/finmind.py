@@ -23,6 +23,23 @@ from flowscope.data.pit import as_of_filter
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 SHARES_OUTSTANDING_TOLERANCE = 0.005
 REQUEST_INTERVAL_SECONDS = 2.25
+DAILY_BULK_DATASETS = frozenset(
+    {
+        "TaiwanStockPrice",
+        "TaiwanStockMarketValue",
+        "TaiwanStockInstitutionalInvestorsBuySell",
+        "TaiwanStockMarginPurchaseShortSale",
+    }
+)
+PER_SYMBOL_DATASETS = frozenset(
+    {
+        "TaiwanStockFinancialStatements",
+        "TaiwanStockBalanceSheet",
+        "TaiwanStockCashFlowsStatement",
+        "TaiwanStockDividendResult",
+        "TaiwanStockMonthRevenue",
+    }
+)
 
 
 class FinMindError(RuntimeError):
@@ -234,6 +251,8 @@ class FinMindProvider:
                     (pl.col("margin_balance") / pl.col("margin_limit") * 100).alias(
                         "margin_quota_used_pct"
                     ),
+                    # FinMind `TaiwanStockSecuritiesLending` 是交易明細,不是餘額。
+                    # 沒有期初餘額時不得把區間內淨額假裝成 balance。
                     pl.lit(None, dtype=pl.Float64).alias("securities_lending_balance"),
                 )
                 .select(
@@ -448,8 +467,14 @@ class FinMindProvider:
         start: date,
         end: date,
     ) -> list[dict[str, Any]]:
-        data_id = symbols[0] if len(symbols) == 1 else None
-        rows = self._fetch_dataset(dataset, data_id, start, end)
+        if len(symbols) == 1:
+            rows = self._fetch_dataset(dataset, symbols[0], start, end)
+        elif dataset in DAILY_BULK_DATASETS:
+            rows = self._fetch_daily_bulk_dataset_for_symbols(dataset, symbols, start, end)
+        elif dataset in PER_SYMBOL_DATASETS:
+            rows = self._fetch_per_symbol_dataset(dataset, symbols, start, end)
+        else:
+            raise FinMindError(f"{dataset} multi-symbol fetch strategy is not defined")
         wanted = set(symbols)
         return [
             row
@@ -457,6 +482,50 @@ class FinMindProvider:
             if str(row.get("stock_id")) in wanted
             and start <= date.fromisoformat(str(row["date"])) <= end
         ]
+
+    def _fetch_daily_bulk_dataset_for_symbols(
+        self,
+        dataset: str,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> list[dict[str, Any]]:
+        requested_dates = self._trading_dates(start, end)
+        rows: list[dict[str, Any]] = []
+        for trading_date in requested_dates:
+            rows.extend(self._fetch_dataset(dataset, None, trading_date, trading_date))
+        returned_dates = {
+            date.fromisoformat(str(row["date"]))
+            for row in rows
+            if str(row.get("stock_id")) in set(symbols)
+        }
+        if returned_dates != set(requested_dates):
+            missing = sorted(set(requested_dates) - returned_dates)
+            extra = sorted(returned_dates - set(requested_dates))
+            raise FinMindError(
+                f"{dataset} daily bulk returned dates do not match trading calendar: "
+                f"missing={format_dates(missing)}, extra={format_dates(extra)}"
+            )
+        return rows
+
+    def _fetch_per_symbol_dataset(
+        self,
+        dataset: str,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for symbol in symbols:
+            rows.extend(self._fetch_dataset(dataset, symbol, start, end))
+        return rows
+
+    def _trading_dates(self, start: date, end: date) -> tuple[date, ...]:
+        rows = self._fetch_dataset("TaiwanStockTradingDate", None, start, end)
+        dates = tuple(date.fromisoformat(str(row["date"])) for row in rows)
+        if not dates:
+            raise FinMindError(f"TaiwanStockTradingDate returned no dates for {start}..{end}")
+        return dates
 
     def _fetch_dataset(
         self,
@@ -554,8 +623,18 @@ def balance_shares_as_of(
 
 
 def institutional_sum(df: pl.DataFrame, columns: Iterable[str]) -> pl.Expr:
+    expected = list(columns)
+    found = [column for column in expected if column in df.columns]
+    if not found:
+        joined = ", ".join(expected)
+        raise FinMindError(f"None of the expected institutional columns exist: {joined}")
     expression = pl.lit(0, dtype=pl.Int64)
-    for column in columns:
-        if column in df.columns:
-            expression += pl.col(column).fill_null(0)
+    for column in found:
+        expression += pl.col(column).fill_null(0)
     return expression
+
+
+def format_dates(values: list[date]) -> str:
+    if not values:
+        return "[]"
+    return "[" + ", ".join(value.isoformat() for value in values) + "]"
