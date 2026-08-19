@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import polars as pl
 
@@ -40,6 +40,17 @@ PER_SYMBOL_DATASETS = frozenset(
         "TaiwanStockMonthRevenue",
     }
 )
+TDCC_HOLDER_DATASET = "TaiwanStockHoldingSharesPer"
+TDCC_SHARE_PCT_TOLERANCE = 0.5
+
+
+class FinMindRowsClient(Protocol):
+    def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class FinMindPayloadClient(Protocol):
+    def fetch_payload(self, request: FinMindRequest) -> dict[str, Any]: ...
 
 
 class FinMindError(RuntimeError):
@@ -72,6 +83,9 @@ class FinMindClient:
         self._last_request_at = 0.0
 
     def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+        return extract_rows(self.fetch_payload(request), request.dataset)
+
+    def fetch_payload(self, request: FinMindRequest) -> dict[str, Any]:
         params = self._params(request)
         last_error: FinMindError | None = None
         for attempt in range(1, self._max_attempts + 1):
@@ -80,7 +94,9 @@ class FinMindClient:
             try:
                 with urllib.request.urlopen(url, timeout=60) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                return self._extract_rows(payload, request.dataset)
+                if not isinstance(payload, dict):
+                    raise FinMindError(f"{request.dataset} returned a non-object payload")
+                return payload
             except urllib.error.HTTPError as exc:
                 last_error = self._from_http_error(exc, request.dataset)
             except urllib.error.URLError as exc:
@@ -113,22 +129,6 @@ class FinMindClient:
             time.sleep(self._request_interval_seconds - elapsed)
         self._last_request_at = time.monotonic()
 
-    def _extract_rows(self, payload: object, dataset: str) -> list[dict[str, Any]]:
-        if not isinstance(payload, dict):
-            raise FinMindError(f"{dataset} returned a non-object payload")
-        msg = str(payload.get("msg", ""))
-        lowered = msg.lower()
-        if any(term in lowered for term in ("level", "sponsor", "upgrade", "permission")):
-            raise FinMindError(f"{dataset} permission denied: {msg}")
-        if any(term in lowered for term in ("limit", "too many requests", "rate")):
-            raise FinMindError(f"{dataset} rate limited: {msg}")
-        rows = payload.get("data")
-        if not isinstance(rows, list) or not rows:
-            raise FinMindError(f"{dataset} returned no rows")
-        if not all(isinstance(row, dict) for row in rows):
-            raise FinMindError(f"{dataset} returned malformed rows")
-        return rows
-
     def _from_http_error(self, exc: urllib.error.HTTPError, dataset: str) -> FinMindError:
         body = exc.read().decode("utf-8", errors="replace")[:200]
         if exc.code == 429:
@@ -145,10 +145,11 @@ class FinMindProvider:
         data_root: Path = Path("data"),
         token: str | None = None,
         no_cache: bool = False,
-        client: FinMindClient | None = None,
+        client: FinMindRowsClient | None = None,
     ) -> None:
         self._no_cache = no_cache
         self._cache = ParquetCache(data_root / "raw")
+        self._tdcc_raw_root = data_root / "raw" / "tdcc"
         self._client = client or FinMindClient(token or load_finmind_token())
 
     def get_ohlcv(
@@ -267,6 +268,54 @@ class FinMindProvider:
             )
 
         return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+
+    def get_holder_distribution(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        validate_symbols(symbols)
+        key = cache_key("get_holder_distribution", symbols, start, end)
+
+        def fetch() -> pl.DataFrame:
+            rows = self._fetch_holder_rows(symbols, start, end)
+            df = frame_from_rows(rows)
+            data_dates = sorted({date.fromisoformat(str(row["date"])) for row in rows})
+            publish_dates = self._holder_publish_dates(data_dates, end)
+            records: list[dict[str, object]] = []
+            for row in df.iter_rows(named=True):
+                parsed = parse_holding_level(str(row["HoldingSharesLevel"]), row)
+                if parsed is None:
+                    continue
+                data_date = date.fromisoformat(str(row["date"]))
+                records.append(
+                    {
+                        "symbol": str(row["stock_id"]),
+                        "data_date": data_date,
+                        "publish_date": publish_dates[data_date],
+                        "tier": parsed,
+                        "holder_count": int(row["people"]),
+                        "share_count": int(row["unit"]),
+                        "share_pct": float(row["percent"]),
+                    }
+                )
+            if not records:
+                raise FinMindError(f"{TDCC_HOLDER_DATASET} returned no holder tier rows")
+            parsed_df = pl.DataFrame(records).sort(["symbol", "data_date", "tier"])
+            return mark_share_pct_sum(parsed_df)
+
+        return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+
+    def get_holder_distribution_daily(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        weekly = self.get_holder_distribution(symbols, start, end)
+        calendar = self.get_trading_calendar(start, end)
+        return align_holder_distribution_to_trading_days(weekly, calendar, start, end)
 
     def get_monthly_revenue(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         validate_symbols(symbols)
@@ -520,6 +569,98 @@ class FinMindProvider:
             rows.extend(self._fetch_dataset(dataset, symbol, start, end))
         return rows
 
+    def _fetch_holder_rows(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> list[dict[str, Any]]:
+        if len(symbols) == 1:
+            return self._fetch_tdcc_payload_rows(
+                FinMindRequest(TDCC_HOLDER_DATASET, symbols[0], start, end)
+            )
+
+        seed_rows = self._fetch_tdcc_payload_rows(
+            FinMindRequest(TDCC_HOLDER_DATASET, symbols[0], start, end)
+        )
+        holder_dates = sorted(
+            {
+                date.fromisoformat(str(row["date"]))
+                for row in seed_rows
+                if start <= date.fromisoformat(str(row["date"])) <= end
+            }
+        )
+        if not holder_dates:
+            raise FinMindError(
+                f"{TDCC_HOLDER_DATASET} returned no holder dates for {symbols[0]}"
+            )
+
+        rows: list[dict[str, Any]] = []
+        for holder_date in holder_dates:
+            daily_rows = self._fetch_tdcc_payload_rows(
+                FinMindRequest(TDCC_HOLDER_DATASET, None, holder_date, holder_date)
+            )
+            returned_dates = {date.fromisoformat(str(row["date"])) for row in daily_rows}
+            if returned_dates != {holder_date}:
+                returned = format_dates(sorted(returned_dates))
+                raise FinMindError(
+                    f"{TDCC_HOLDER_DATASET} bulk returned dates do not match request: "
+                    f"requested={holder_date.isoformat()}, returned={returned}"
+                )
+            rows.extend(daily_rows)
+        wanted = set(symbols)
+        return [row for row in rows if str(row.get("stock_id")) in wanted]
+
+    def _fetch_tdcc_payload_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+        payload = self._fetch_payload(request)
+        rows = extract_rows(payload, request.dataset)
+        dates = sorted({date.fromisoformat(str(row["date"])) for row in rows})
+        self._save_tdcc_payload(payload, request, dates)
+        return rows
+
+    def _fetch_payload(self, request: FinMindRequest) -> dict[str, Any]:
+        if isinstance(self._client, FinMindPayloadClient):
+            return self._client.fetch_payload(request)
+        rows = self._client.fetch_rows(request)
+        return {"msg": "success", "data": rows}
+
+    def _save_tdcc_payload(
+        self,
+        payload: dict[str, Any],
+        request: FinMindRequest,
+        data_dates: list[date],
+    ) -> None:
+        symbol = request.data_id or "ALL"
+        start = request.start.isoformat() if request.start is not None else "none"
+        end = request.end.isoformat() if request.end is not None else "none"
+        filename = f"{request.dataset}_{symbol}_{start}_{end}.json"
+        for data_date in data_dates:
+            directory = self._tdcc_raw_root / data_date.isoformat()
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / filename).write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+
+    def _holder_publish_dates(self, data_dates: list[date], query_end: date) -> dict[date, date]:
+        if not data_dates:
+            return {}
+        calendar = self.get_trading_calendar(min(data_dates), query_end + timedelta(days=14))
+        publish_dates: dict[date, date] = {}
+        for data_date in data_dates:
+            raw_publish_date = data_date + timedelta(days=7)
+            if raw_publish_date > query_end:
+                publish_dates[data_date] = raw_publish_date
+                continue
+            try:
+                publish_dates[data_date] = calendar.on_or_after(raw_publish_date)
+            except ValueError as exc:
+                raise FinMindError(
+                    "Trading calendar cannot align holder publish_date for "
+                    f"{data_date.isoformat()}"
+                ) from exc
+        return publish_dates
+
     def _trading_dates(self, start: date, end: date) -> tuple[date, ...]:
         rows = self._fetch_dataset("TaiwanStockTradingDate", None, start, end)
         dates = tuple(date.fromisoformat(str(row["date"])) for row in rows)
@@ -573,6 +714,108 @@ def frame_from_rows(rows: list[dict[str, Any]]) -> pl.DataFrame:
     if not rows:
         raise FinMindError("FinMind returned no rows after local filtering")
     return pl.DataFrame(rows)
+
+
+def extract_rows(payload: object, dataset: str) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise FinMindError(f"{dataset} returned a non-object payload")
+    msg = str(payload.get("msg", ""))
+    lowered = msg.lower()
+    if any(term in lowered for term in ("level", "sponsor", "upgrade", "permission")):
+        raise FinMindError(f"{dataset} permission denied: {msg}")
+    if any(term in lowered for term in ("limit", "too many requests", "rate")):
+        raise FinMindError(f"{dataset} rate limited: {msg}")
+    rows = payload.get("data")
+    if not isinstance(rows, list) or not rows:
+        raise FinMindError(f"{dataset} returned no rows")
+    if not all(isinstance(row, dict) for row in rows):
+        raise FinMindError(f"{dataset} returned malformed rows")
+    return rows
+
+
+def parse_holding_level(label: str, row: dict[str, object]) -> int | None:
+    normalized = label.strip().lower().replace(",", "")
+    if normalized == "total":
+        return None
+    if normalized.startswith("more than "):
+        return int(normalized.removeprefix("more than ").strip())
+    if "-" in normalized:
+        lower, _upper = normalized.split("-", 1)
+        return int(lower.strip())
+    percent_value = row.get("percent", 0.0)
+    unit_value = row.get("unit", 0.0)
+    percent = float(percent_value) if isinstance(percent_value, int | float | str) else 0.0
+    unit = float(unit_value) if isinstance(unit_value, int | float | str) else 0.0
+    # FinMind 會回傳非級距的調整列；百分比為 0 且股數非正時不可混入級距加總。
+    if percent == 0.0 and unit <= 0.0:
+        return None
+    raise FinMindError(f"Unknown holder share level: {label}")
+
+
+def mark_share_pct_sum(df: pl.DataFrame) -> pl.DataFrame:
+    sums = df.group_by(["symbol", "data_date"]).agg(
+        pl.col("share_pct").sum().alias("share_pct_sum")
+    )
+    return (
+        df.join(sums, on=["symbol", "data_date"], how="left")
+        .with_columns(
+            ((pl.col("share_pct_sum") - 100.0).abs() <= TDCC_SHARE_PCT_TOLERANCE).alias(
+                "share_pct_sum_ok"
+            )
+        )
+        .select(
+            "symbol",
+            "data_date",
+            "publish_date",
+            "tier",
+            "holder_count",
+            "share_count",
+            "share_pct",
+            "share_pct_sum",
+            "share_pct_sum_ok",
+        )
+        .sort(["symbol", "data_date", "tier"])
+    )
+
+
+def align_holder_distribution_to_trading_days(
+    holder_distribution: pl.DataFrame,
+    calendar: TradingCalendar,
+    start: date,
+    end: date,
+) -> pl.DataFrame:
+    if holder_distribution.is_empty():
+        raise FinMindError("Cannot align empty holder distribution")
+    daily_dates = [
+        trading_date for trading_date in calendar.dates if start <= trading_date <= end
+    ]
+    records: list[dict[str, object]] = []
+    for trading_date in daily_dates:
+        visible = holder_distribution.filter(pl.col("publish_date") <= trading_date)
+        if visible.is_empty():
+            continue
+        latest_dates = visible.group_by(["symbol", "tier"]).agg(pl.col("data_date").max())
+        latest = visible.join(latest_dates, on=["symbol", "tier", "data_date"], how="inner")
+        for row in latest.iter_rows(named=True):
+            enriched = dict(row)
+            enriched["as_of_date"] = trading_date
+            records.append(enriched)
+    if not records:
+        return holder_distribution.head(0).with_columns(
+            pl.lit(None, dtype=pl.Date).alias("as_of_date")
+        )
+    return pl.DataFrame(records).select(
+        "symbol",
+        "as_of_date",
+        "data_date",
+        "publish_date",
+        "tier",
+        "holder_count",
+        "share_count",
+        "share_pct",
+        "share_pct_sum",
+        "share_pct_sum_ok",
+    )
 
 
 def financial_publish_date(period_end: date) -> date:

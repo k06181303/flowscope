@@ -6,15 +6,18 @@ from typing import Any
 
 import pytest
 
+from flowscope.data.calendar import TradingCalendar
 from flowscope.data.providers.finmind import (
     FinMindError,
     FinMindProvider,
     FinMindRequest,
+    align_holder_distribution_to_trading_days,
     balance_shares_as_of,
     financial_publish_date,
     latest_balance_lookup,
     month_end,
     next_month_tenth,
+    parse_holding_level,
 )
 
 
@@ -77,7 +80,20 @@ class StaticClient:
                 }
             ]
         if request.dataset == "TaiwanStockTradingDate":
-            return [{"date": "2024-01-02"}, {"date": "2024-01-03"}, {"date": "2024-01-04"}]
+            return filter_requested_dates(
+                [
+                    {"date": "2024-01-02"},
+                    {"date": "2024-01-03"},
+                    {"date": "2024-01-04"},
+                    {"date": "2024-01-08"},
+                    {"date": "2024-01-09"},
+                    {"date": "2024-01-10"},
+                    {"date": "2024-01-11"},
+                    {"date": "2024-01-15"},
+                    {"date": "2024-01-16"},
+                ],
+                request,
+            )
         if request.dataset == "TaiwanStockMarginPurchaseShortSale":
             return [
                 margin_row("2024-01-02"),
@@ -107,6 +123,15 @@ class StaticClient:
                     "origin_name": "revenue",
                 }
             ]
+        if request.dataset == "TaiwanStockHoldingSharesPer":
+            if request.data_id is None:
+                assert request.start == request.end
+                return holder_rows("2330", request.start.isoformat()) + holder_rows(
+                    "2317",
+                    request.start.isoformat(),
+                )
+            symbol = request.data_id or "2330"
+            return holder_rows(symbol, "2024-01-05") + holder_rows(symbol, "2024-01-12")
         raise AssertionError(f"unexpected dataset {request.dataset}")
 
 
@@ -269,6 +294,128 @@ def test_get_margin_maps_daily_publish_date(tmp_path: Path) -> None:
     assert df["margin_quota_used_pct"].to_list() == pytest.approx([10.0, 10.0, 10.0])
 
 
+def test_get_holder_distribution_parses_levels_and_aligns_publish_date(tmp_path: Path) -> None:
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=StaticClient())  # type: ignore[arg-type]
+
+    df = provider.get_holder_distribution(["2330"], date(2024, 1, 5), date(2024, 1, 16))
+
+    assert df.columns == [
+        "symbol",
+        "data_date",
+        "publish_date",
+        "tier",
+        "holder_count",
+        "share_count",
+        "share_pct",
+        "share_pct_sum",
+        "share_pct_sum_ok",
+    ]
+    assert df["publish_date"].to_list() == [
+        date(2024, 1, 15),
+        date(2024, 1, 15),
+    ]
+    assert df["tier"].to_list() == [1, 400_001]
+    assert df["share_pct"].to_list() == pytest.approx([20.0, 80.0])
+    assert df["share_pct_sum_ok"].to_list() == [True, True]
+
+
+def test_get_holder_distribution_saves_raw_payload_by_data_date(tmp_path: Path) -> None:
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=StaticClient())  # type: ignore[arg-type]
+
+    provider.get_holder_distribution(["2330"], date(2024, 1, 5), date(2024, 1, 16))
+
+    first_raw_dir = tmp_path / "raw" / "tdcc" / "2024-01-05"
+    second_raw_dir = tmp_path / "raw" / "tdcc" / "2024-01-12"
+    assert list(first_raw_dir.glob("TaiwanStockHoldingSharesPer_2330_*.json"))
+    assert list(second_raw_dir.glob("TaiwanStockHoldingSharesPer_2330_*.json"))
+
+
+def test_holder_distribution_for_multiple_symbols_uses_bulk_per_holder_date(
+    tmp_path: Path,
+) -> None:
+    client = StaticClient()
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=client)  # type: ignore[arg-type]
+
+    df = provider.get_holder_distribution(
+        ["2330", "2317"],
+        date(2024, 1, 5),
+        date(2024, 1, 16),
+    )
+
+    bulk_calls = [
+        call
+        for call in client.calls
+        if call.dataset == "TaiwanStockHoldingSharesPer" and call.data_id is None
+    ]
+    assert {call.start for call in bulk_calls} == {date(2024, 1, 5), date(2024, 1, 12)}
+    assert set(df["symbol"].to_list()) == {"2330", "2317"}
+
+
+def test_holder_distribution_marks_bad_share_pct_sum(tmp_path: Path) -> None:
+    class BadPctClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            if request.dataset == "TaiwanStockHoldingSharesPer":
+                return [
+                    holder_row("2330", "2024-01-05", "1-999", 10, 10.0, 100),
+                    holder_row("2330", "2024-01-05", "400,001-600,000", 1, 80.0, 800),
+                    holder_row("2330", "2024-01-05", "total", 11, 90.0, 900),
+                ]
+            return super().fetch_rows(request)
+
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=BadPctClient())  # type: ignore[arg-type]
+
+    df = provider.get_holder_distribution(["2330"], date(2024, 1, 5), date(2024, 1, 16))
+
+    assert df["share_pct_sum"].to_list() == pytest.approx([90.0, 90.0])
+    assert df["share_pct_sum_ok"].to_list() == [False, False]
+
+
+def test_unknown_nonzero_holder_level_raises() -> None:
+    with pytest.raises(FinMindError, match="Unknown holder share level"):
+        parse_holding_level("new unexpected level", {"percent": 1.0, "unit": 100})
+
+
+def test_holder_daily_alignment_does_not_forward_fill_before_publish_date() -> None:
+    import polars as pl
+
+    weekly = pl.DataFrame(
+        [
+            {
+                "symbol": "2330",
+                "data_date": date(2024, 1, 5),
+                "publish_date": date(2024, 1, 12),
+                "tier": 400_001,
+                "holder_count": 1,
+                "share_count": 800,
+                "share_pct": 80.0,
+                "share_pct_sum": 100.0,
+                "share_pct_sum_ok": True,
+            }
+        ]
+    )
+    calendar = TradingCalendar(
+        (
+            date(2024, 1, 8),
+            date(2024, 1, 11),
+            date(2024, 1, 12),
+            date(2024, 1, 15),
+        )
+    )
+
+    daily = align_holder_distribution_to_trading_days(
+        weekly,
+        calendar,
+        date(2024, 1, 8),
+        date(2024, 1, 15),
+    )
+
+    assert daily["as_of_date"].to_list() == [date(2024, 1, 12), date(2024, 1, 15)]
+    assert all(
+        row <= as_of
+        for row, as_of in zip(daily["publish_date"], daily["as_of_date"], strict=True)
+    )
+
+
 def test_monthly_revenue_uses_revenue_month_not_api_date(tmp_path: Path) -> None:
     provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=StaticClient())  # type: ignore[arg-type]
 
@@ -357,3 +504,43 @@ def margin_row(day: str) -> dict[str, object]:
         "ShortSaleTodayBalance": 10,
         "MarginPurchaseLimit": 1000,
     }
+
+
+def holder_rows(symbol: str, day: str) -> list[dict[str, object]]:
+    return [
+        holder_row(symbol, day, "1-999", 10, 20.0, 200),
+        holder_row(symbol, day, "400,001-600,000", 1, 80.0, 800),
+        holder_row(symbol, day, "total", 11, 100.0, 1000),
+        holder_row(symbol, day, "adjustment", 1, 0.0, -1),
+    ]
+
+
+def holder_row(
+    symbol: str,
+    day: str,
+    level: str,
+    people: int,
+    percent: float,
+    unit: int,
+) -> dict[str, object]:
+    return {
+        "date": day,
+        "stock_id": symbol,
+        "HoldingSharesLevel": level,
+        "people": people,
+        "percent": percent,
+        "unit": unit,
+    }
+
+
+def filter_requested_dates(
+    rows: list[dict[str, object]],
+    request: FinMindRequest,
+) -> list[dict[str, object]]:
+    if request.start is None or request.end is None:
+        return rows
+    return [
+        row
+        for row in rows
+        if request.start <= date.fromisoformat(str(row["date"])) <= request.end
+    ]

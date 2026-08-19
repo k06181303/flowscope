@@ -6,11 +6,11 @@
 
 ## 目前狀態
 
-**Step 2 CONDITIONAL 補修完成,待審查複核。**
+**Step 3 完成,待審查。**
 
-下一步:審查通過後進入 SPEC §13 **Step 3 — 集保 provider (FinMind) + 解析 + PIT 對齊**
+下一步:審查通過後進入 SPEC §13 **Step 4 — Universe + L0/L1 Gate + 漏斗輸出**
 
-DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
+DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d` 並向後對齊交易日;`tests/test_pit.py` 通過
 
 ---
 
@@ -20,6 +20,7 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 |---|---|---|---|---|
 | 1 | 專案骨架、config schema、CLI 空殼 | 2026-08-18 | 是 | `step-1: initialize project skeleton` |
 | 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer`;`step-2: fix FinMind batching safeguards` |
+| 3 | 集保 provider (FinMind) + 解析 + PIT 對齊 | 2026-08-19 | 是 | `step-3: implement FinMind holder distribution` |
 
 ---
 
@@ -39,6 +40,9 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | 2 | TWSE / TPEx 注意股、全額交割股補充來源 | Step 2 僅接 FinMind 資料層；PROGRESS #13 已裁定缺口需另尋官方來源 | 是，Step 4 L1 gate 前補做 |
 | 2 | `symbol_map.parquet` 未建立 | SPEC §4.2 #3 要求記錄符號變更與合併映射；Step 2 尚未接到可驗證的官方符號事件來源，建立空表會讓歷史 symbol 對齊看似完成 | 是，Step 4 universe/PIT listings 重建前補做 |
 | 2 | `securities_lending_balance` 目前回傳 `null` | `TaiwanStockSecuritiesLending` 免費層可取得，但實測欄位是借券交易明細，不是日末餘額；無期初餘額時不得把區間淨額偽造成 balance | 是，使用此欄位前需決定可驗證餘額來源或長歷史重建方法 |
+| 3 | 集保官網爬蟲與原始 HTML/CSV 保存 | SPEC 已於 2026-08-18 修訂:Phase 1 集保來源改為 FinMind `TaiwanStockHoldingSharesPer`;集保官網爬蟲降級 Phase 2 備援 | 否，除非 Phase 2 啟用備援爬蟲 |
+| 3 | C01–C17 籌碼因子計算 | Step 3 只做資料層、解析與 PIT 對齊；SPEC §13 將籌碼因子列為 Step 6 | 是，Step 6 補做 |
+| 3 | 自動化對照集保官網近期頁面 | 本步已保留 FinMind 原始 JSON 並以真實 API 驗證級距解析與比例合計；官方網站人工抽查屬審查手動驗算項，尚未寫入自動測試 | 建議 Step 3 審查時由審查者抽查近 3 週 `big_holder_pct` |
 
 ---
 
@@ -62,6 +66,7 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | 14 | **集保資料 2016 年前為月頻**(2026-08-19 實測發現) | **已決定** | 實測 2330:2010–2015 為月頻(每月最後營業日),2016 起才是週頻。C05 的 `slope_weeks: 8` / `zscore_weeks: 52` 假設週頻,`as_of < 2016` 時語意錯誤但不會報錯。實際可用起點為 2016-01,早於此日期 C05 應回傳 null 並記錄。詳見 `docs/FinMind_API_Inventory.md` §4.1 |
 | 15 | **FinMind 財報無公布日欄位**(2026-08-19 實測確認) | **已決定** | 實測回傳欄位僅 `date`(期別)/`origin_name`/`stock_id`/`type`/`value`。`publish_date` 須自行推導,**Q4 用 +75 天**而非 +45 天。此為 Phase 1 最大 PIT 風險點,Step 2 須以 Review Protocol §2.1 方法驗證。財報為 long format,Altman Z / Beneish M 輸入需先 pivot |
 | 16 | FinMind 訂閱方案 | **已決定** | **Backer($699/月)**。2026-08-19 實測 17 個 Phase 1 dataset 全部可存取。$999 多的分點/分K/即時報價 Phase 1 均用不到(SPEC §4.4 明列分點不實作)。速率 1,600 req/hr,**回補必須按日期批次下載,不得逐檔查詢** |
+| 17 | **G6** `securities_lending_balance` FinMind 無日末餘額(2026-08-19 實測確認) | **已決定** | `TaiwanStockSecuritiesLending` 欄位為 `transaction_type`/`volume`/`fee_rate`/`original_return_date`,是逐筆借券交易明細,非日末餘額;無期初餘額不得推導。**決定:另尋 TWSE 借券餘額來源**。在來源接上前 `get_margin` 的此欄位維持 `null` 並記錄,不得以明細淨額偽造 |
 
 > **G2/G4 的副作用(審查時必讀):** L1 少掉兩條排除條件,實際攔截檔數會低於 SPEC §5.2 預期的 50–150 檔。
 > 這是已知且已接受的缺口,**不得為了把數字湊回預期區間而放寬其他 L1 門檻**——那違反 SPEC §15 第 8 條。
@@ -77,6 +82,7 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 | 3 | 集保頻率 2016 年前為月頻 | C05 及整個籌碼維度 | 見待決表 #14,實際可用起點暫定 2016-01 |
 | 4 | SPEC §4.2 第 1 點原寫「還原以最新價為基準」,與 Review Protocol §2.1 將最新基準列為 PIT 洩漏風險相矛盾 | 還原價實作依據與後續審查口徑 | 已由使用者裁定並修訂 SPEC §4.2:改為 `as_of` 基準；Step 2 provider 已採用原始價 + `TaiwanStockDividendResult` 自行 backward adjustment,且除權息事件截止日不得晚於 `as_of` |
 | 5 | 全市場回補時間受 FinMind Backer 1,600 req/hr 限制 | 初次建置資料湖與 `--no-cache` 大範圍重抓 | 粗估 3 年全市場 Step 2 來源約 11,900 requests、至少 7.5 小時:日頻 bulk 4 個 dataset 約 2,920 requests/1.8 小時；財報三表逐檔約 5,400 requests/3.4 小時；股利與月營收逐檔約 3,600 requests/2.3 小時。實際時間會因重試、限流與快取命中率增加或減少 |
+| 6 | 集保全市場回補需用逐資料日 bulk,不可逐檔 | Step 3 holder provider | 實測 `TaiwanStockHoldingSharesPer data_id=None` 只回 `start_date` 當日全市場。實作採單檔區間請求；多檔先用第一檔找出資料日,再逐資料日 bulk。2 年全市場約 100–110 個 holder data-date requests,Backer 1,600 req/hr 下約 4–5 分鐘,另加一次 seed request與重試/快取開銷 |
 
 ---
 
@@ -86,3 +92,4 @@ DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 |---|---|---|---|
 | 2026-08-18 | 1 | CONDITIONAL | 需補跳過揭露、factor params 驗證、distribution warning 門檻驗證 |
 | 2026-08-19 | 2 | CONDITIONAL | 需補多檔逐日期抓取、財報逐檔抓取、法人欄位改名防呆、借券餘額揭露、SPEC §4.2 矛盾揭露 |
+| 2026-08-19 | 3 | 待審查 | 已補 FinMind 集保 provider、原始 JSON 保存、級距下界解析、比例合計標記、公布日交易日對齊與日頻 PIT forward fill |

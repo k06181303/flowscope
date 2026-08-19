@@ -23,7 +23,7 @@ app.add_typer(report_app, name="report")
 
 
 def _step_message(command: str) -> None:
-    typer.echo(f"{command} is not implemented in Step 1.")
+    typer.echo(f"{command} is not implemented in the current SPEC step.")
 
 
 def _parse_iso_date(value: str | None, option_name: str) -> str | None:
@@ -101,9 +101,7 @@ def data_sync(
     ] = False,
 ) -> None:
     if source != "finmind":
-        raise typer.BadParameter("Step 2 supports --source finmind")
-    if weekly:
-        raise typer.BadParameter("weekly sync is reserved for Step 3 holder distribution")
+        raise typer.BadParameter("data sync currently supports --source finmind")
 
     parsed_end = _parse_date(end, "--end") or date.today()
     parsed_start = _parse_date(start, "--start") or parsed_end - timedelta(days=366 * 3)
@@ -112,6 +110,14 @@ def data_sync(
 
     try:
         provider = FinMindProvider(no_cache=no_cache)
+        if weekly:
+            holder = provider.get_holder_distribution([symbol], parsed_start, parsed_end)
+            typer.echo(
+                "Synced holder distribution: "
+                f"source=finmind, symbol={symbol}, start={parsed_start.isoformat()}, "
+                f"end={parsed_end.isoformat()}, rows={holder.height}"
+            )
+            return
         ohlcv = provider.get_ohlcv([symbol], parsed_start, parsed_end, adjusted=True)
     except FinMindError as exc:
         typer.secho(f"Error: {exc}", err=True)
