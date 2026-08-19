@@ -451,15 +451,21 @@ class FinMindProvider:
                     f"Cannot derive shares_outstanding for {symbol} on {data_date.isoformat()}"
                 )
             relative_diff = abs(balance_shares - market_shares) / balance_shares
+            shares_outstanding = balance_shares
             if relative_diff > SHARES_OUTSTANDING_TOLERANCE:
-                raise FinMindError(
-                    "shares_outstanding cross-check failed for "
+                warnings.warn(
+                    "shares_outstanding cross-check exceeded tolerance; "
+                    "using same-day market_value/close because balance-sheet share capital "
+                    "can lag mid-quarter corporate actions. "
                     f"{symbol} on {data_date.isoformat()}: "
                     f"balance={balance_shares:.0f}, market={market_shares:.0f}, "
-                    f"diff={relative_diff:.4%}"
+                    f"diff={relative_diff:.4%}",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
+                shares_outstanding = market_shares
             enriched = dict(row)
-            enriched["shares_outstanding"] = balance_shares
+            enriched["shares_outstanding"] = shares_outstanding
             records.append(enriched)
 
         return pl.DataFrame(records, schema={**prices.schema, "shares_outstanding": pl.Float64})

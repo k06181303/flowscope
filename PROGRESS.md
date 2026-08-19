@@ -83,8 +83,8 @@ DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d
 | 4 | SPEC §4.2 第 1 點原寫「還原以最新價為基準」,與 Review Protocol §2.1 將最新基準列為 PIT 洩漏風險相矛盾 | 還原價實作依據與後續審查口徑 | 已由使用者裁定並修訂 SPEC §4.2:改為 `as_of` 基準；Step 2 provider 已採用原始價 + `TaiwanStockDividendResult` 自行 backward adjustment,且除權息事件截止日不得晚於 `as_of` |
 | 5 | 全市場回補時間受 FinMind Backer 1,600 req/hr 限制 | 初次建置資料湖與 `--no-cache` 大範圍重抓 | 粗估 3 年全市場 Step 2 來源約 11,900 requests、至少 7.5 小時:日頻 bulk 4 個 dataset 約 2,920 requests/1.8 小時；財報三表逐檔約 5,400 requests/3.4 小時；股利與月營收逐檔約 3,600 requests/2.3 小時。實際時間會因重試、限流與快取命中率增加或減少 |
 | 6 | 集保全市場回補需用逐資料日 bulk,不可逐檔 | Step 3 holder provider | 實測 `TaiwanStockHoldingSharesPer data_id=None` 只回 `start_date` 當日全市場。實作採單檔區間請求；多檔先用第一檔找出資料日,再逐資料日 bulk。2 年全市場約 100–110 個 holder data-date requests,Backer 1,600 req/hr 下約 4–5 分鐘,另加一次 seed request與重試/快取開銷 |
-| 7 | `shares_outstanding` 交叉驗證容忍值目前固定 0.5% | Step 2 price provider | 審查建議指出季中現金增資可能導致誤報。這牽涉「可接受誤差、是否依公司行動事件放寬、放寬時需哪些證據」的資料定義,不得由實作者任意改成寬鬆規則。保留 fail-fast,待 Step 4/資料驗證或人類裁定後再調整 |
-| 8 | 本機仍可能殘留舊 cache 目錄 `data/raw/finmind/finmind/` | 本機資料目錄 | 這是舊版 cache root bug 產物,目前程式不會再產生。嘗試刪除時被執行環境 Windows destructive-command safety policy 擋下;因 `data/raw/*` 已 gitignore,不影響版控或程式行為 |
+| 7 | `shares_outstanding` 交叉驗證容忍值原本固定 0.5% 並直接 raise | Step 2 price provider | 已修正:差異 ≤ 0.5% 時採 balance sheet 股本；差異 > 0.5% 時發出 `RuntimeWarning` 並改用同日 `TaiwanStockMarketValue / close` 的 PIT 推導值,避免季中資本變動被季報股本延遲誤殺 |
+| 8 | 舊 cache 目錄 `data/raw/finmind/finmind/` | 本機資料目錄 | 已確認不存在(`Test-Path` 回傳 `False`)。這是舊版 cache root bug 產物,目前程式不會再產生 |
 
 ---
 

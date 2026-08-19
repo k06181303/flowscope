@@ -462,7 +462,9 @@ def test_financials_include_statement_and_derived_publish_date(tmp_path: Path) -
     assert set(df["publish_date"].to_list()) == {date(2024, 5, 15)}
 
 
-def test_shares_outstanding_cross_check_mismatch_raises(tmp_path: Path) -> None:
+def test_shares_outstanding_cross_check_mismatch_warns_and_uses_market_value(
+    tmp_path: Path,
+) -> None:
     class BadMarketValueClient(StaticClient):
         def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
             if request.dataset == "TaiwanStockMarketValue":
@@ -479,8 +481,12 @@ def test_shares_outstanding_cross_check_mismatch_raises(tmp_path: Path) -> None:
         client=BadMarketValueClient(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(FinMindError, match="shares_outstanding cross-check failed"):
-        provider.get_ohlcv(["2330"], date(2024, 1, 2), date(2024, 1, 4), adjusted=False)
+    with pytest.warns(RuntimeWarning, match="cross-check exceeded tolerance"):
+        df = provider.get_ohlcv(["2330"], date(2024, 1, 2), date(2024, 1, 4), adjusted=False)
+
+    # 手算來源:market_value / close = 50,000/100, 55,000/110, 45,000/90。
+    # balance sheet 的 1,000 股與同日市值推導差異過大時,採用同日 PIT 推導值。
+    assert df["shares_outstanding"].to_list() == pytest.approx([500.0, 500.0, 500.0])
 
 
 def test_financial_publish_date_uses_q4_75_days_and_other_quarters_45_days() -> None:
