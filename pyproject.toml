@@ -50,3 +50,9 @@ addopts = "--strict-markers --strict-config"
 # Package-wide Step 1 baseline. SPEC 的 85% 門檻只適用於後續
 # factors/scoring/planner 目錄，等那些模組建立後另外精準執行。
 fail_under = 80
+
+[tool.coverage.run]
+omit = [
+    "src/flowscope/__main__.py",
+    "src/flowscope/data/protocols.py",
+]

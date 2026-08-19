@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from flowscope.config.loader import load_config_with_hash
+from flowscope.data.providers.finmind import FinMindError, FinMindProvider
 
 app = typer.Typer(
     help="FlowScope Taiwan stock selection and trade plan generator.",
@@ -26,10 +27,15 @@ def _step_message(command: str) -> None:
 
 
 def _parse_iso_date(value: str | None, option_name: str) -> str | None:
+    parsed = _parse_date(value, option_name)
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _parse_date(value: str | None, option_name: str) -> date | None:
     if value is None:
         return None
     try:
-        return date.fromisoformat(value).isoformat()
+        return date.fromisoformat(value)
     except ValueError:
         raise typer.BadParameter(f"{option_name} must be YYYY-MM-DD") from None
 
@@ -77,17 +83,45 @@ def data_sync(
         str | None,
         typer.Option("--start", help="First data date to synchronize."),
     ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option("--end", help="Last data date to synchronize."),
+    ] = None,
+    symbol: Annotated[
+        str,
+        typer.Option("--symbol", help="Single symbol used for Step 2 OHLCV verification."),
+    ] = "2330",
     weekly: Annotated[
         bool,
         typer.Option("--weekly", help="Synchronize the weekly source cadence."),
     ] = False,
+    no_cache: Annotated[
+        bool,
+        typer.Option("--no-cache", help="Bypass local data cache."),
+    ] = False,
 ) -> None:
-    source_text = f"source={source}"
-    parsed_start = _parse_iso_date(start, "--start")
-    start_text = f", start={parsed_start}" if parsed_start is not None else ""
-    weekly_text = ", weekly=true" if weekly else ""
-    typer.echo(f"{source_text}{start_text}{weekly_text}")
-    _step_message("data sync")
+    if source != "finmind":
+        raise typer.BadParameter("Step 2 supports --source finmind")
+    if weekly:
+        raise typer.BadParameter("weekly sync is reserved for Step 3 holder distribution")
+
+    parsed_end = _parse_date(end, "--end") or date.today()
+    parsed_start = _parse_date(start, "--start") or parsed_end - timedelta(days=366 * 3)
+    if parsed_start > parsed_end:
+        raise typer.BadParameter("--start must be on or before --end")
+
+    try:
+        provider = FinMindProvider(no_cache=no_cache)
+        ohlcv = provider.get_ohlcv([symbol], parsed_start, parsed_end, adjusted=True)
+    except FinMindError as exc:
+        typer.secho(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(
+        "Synced adjusted OHLCV: "
+        f"source=finmind, symbol={symbol}, start={parsed_start.isoformat()}, "
+        f"end={parsed_end.isoformat()}, rows={ohlcv.height}"
+    )
 
 
 @data_app.command("validate")

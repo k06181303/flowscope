@@ -6,11 +6,11 @@
 
 ## 目前狀態
 
-**Step 1 完成。**
+**Step 2 完成。**
 
-下一步:SPEC §13 **Step 2 — 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原**
+下一步:SPEC §13 **Step 3 — 集保 provider (FinMind) + 解析 + PIT 對齊**
 
-DoD:`flowscope --help` 可執行;`mypy src --strict` 通過
+DoD:可取得任一股票 3 年還原日線;`tests/test_pit.py` 通過
 
 ---
 
@@ -19,6 +19,7 @@ DoD:`flowscope --help` 可執行;`mypy src --strict` 通過
 | Step | 內容 | 完成日 | DoD 達成 | Commit |
 |---|---|---|---|---|
 | 1 | 專案骨架、config schema、CLI 空殼 | 2026-08-18 | 是 | `step-1: initialize project skeleton` |
+| 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer` |
 
 ---
 
@@ -33,6 +34,9 @@ DoD:`flowscope --help` 可執行;`mypy src --strict` 通過
 | 1 | SPEC §3 的 `data/`、`universe/`、`factors/`、`scoring/`、`planner/`、`record/`、`report/` 與 `tests/fixtures/` 未建立 | Step 1 的 DoD 是可執行 CLI 與 config schema；這些模組若空殼建立反而容易造成假完成感 | 是，依 Step 2 起各自實作時建立；`tests/fixtures/` 於第一個 golden fixture 測試步驟建立 |
 | 1 | `configs/base.yaml` 與 `configs/logging.yaml` 目前是佔位空殼、無程式讀取 | Step 1 只建立檔案位置；base/market 合併規則尚未在 SPEC §13 Step 1 要求 | 是，預計在 Step 2 接資料層 CLI/config 流程時先定義讀取邊界，完整 base/market 合併規則在 Step 8 評分執行前完成 |
 | 1 | 尚未對 `factors/`、`scoring/`、`planner/` 建立分區 85% coverage gate | 這三個目錄尚未建立；目前 `pyproject.toml` 的 `fail_under = 80` 只作為全套件 Step 1 aggregate baseline | 是，對應模組建立後補上分區門檻或 CI 檢查 |
+| 2 | 集保股權分散 provider (`TaiwanStockHoldingSharesPer`) 與級距解析 | SPEC §13 修訂版將集保列為 Step 3；本步不得提前做 | 是，Step 3 補做 |
+| 2 | `MetaProvider.get_listings()` 的完整 PIT 股票池重建 | Step 2 聚焦資料取得、快取、交易日曆與還原價；`TaiwanStockInfo` 快照配合下市清單重建 universe 屬 Step 4 | 是，Step 4 補做 |
+| 2 | TWSE / TPEx 注意股、全額交割股補充來源 | Step 2 僅接 FinMind 資料層；PROGRESS #13 已裁定缺口需另尋官方來源 | 是，Step 4 L1 gate 前補做 |
 
 ---
 
@@ -53,7 +57,7 @@ DoD:`flowscope --help` 可執行;`mypy src --strict` 通過
 | 11 | **G3** 財報延遲申報 FinMind 無直接欄位 | **已決定** | **另尋 TWSE 來源**(公開資訊觀測站)。在來源接上前,該條 L1 停用並記錄 |
 | 12 | **G4** 董監質押比 FinMind 無資料 | **已決定** | **Phase 1 不實作**,明確記錄為已知缺口。該條原本即為「標記」而非「排除」,影響較小 |
 | 13 | **G5** 注意股 / 全額交割股 FinMind 僅有處置股 | **已決定** | 處置股用 `TaiwanStockDispositionSecuritiesPeriod`;注意股與全額交割股**另尋 TWSE / TPEx 來源**。在來源接上前,L1 僅攔截處置股並記錄缺口 |
-| 14 | **集保資料 2016 年前為月頻**(2026-08-19 實測發現) | **待人類確認** | 實測 2330:2010–2015 為月頻(每月最後營業日),2016 起才是週頻。C05 的 `slope_weeks: 8` / `zscore_weeks: 52` 假設週頻,`as_of < 2016` 時語意錯誤但不會報錯。**暫定實際可用起點為 2016-01**,早於此日期 C05 應回傳 null 並記錄。詳見 `docs/FinMind_API_Inventory.md` §4.1 |
+| 14 | **集保資料 2016 年前為月頻**(2026-08-19 實測發現) | **已決定** | 實測 2330:2010–2015 為月頻(每月最後營業日),2016 起才是週頻。C05 的 `slope_weeks: 8` / `zscore_weeks: 52` 假設週頻,`as_of < 2016` 時語意錯誤但不會報錯。實際可用起點為 2016-01,早於此日期 C05 應回傳 null 並記錄。詳見 `docs/FinMind_API_Inventory.md` §4.1 |
 | 15 | **FinMind 財報無公布日欄位**(2026-08-19 實測確認) | **已決定** | 實測回傳欄位僅 `date`(期別)/`origin_name`/`stock_id`/`type`/`value`。`publish_date` 須自行推導,**Q4 用 +75 天**而非 +45 天。此為 Phase 1 最大 PIT 風險點,Step 2 須以 Review Protocol §2.1 方法驗證。財報為 long format,Altman Z / Beneish M 輸入需先 pivot |
 | 16 | FinMind 訂閱方案 | **已決定** | **Backer($699/月)**。2026-08-19 實測 17 個 Phase 1 dataset 全部可存取。$999 多的分點/分K/即時報價 Phase 1 均用不到(SPEC §4.4 明列分點不實作)。速率 1,600 req/hr,**回補必須按日期批次下載,不得逐檔查詢** |
 
@@ -67,7 +71,7 @@ DoD:`flowscope --help` 可執行;`mypy src --strict` 通過
 | # | 問題 | 影響範圍 | 狀態 |
 |---|---|---|---|
 | 1 | `flowscope.exe` 安裝於 user Scripts 目錄，但該目錄目前不在系統 `PATH` | 直接在新 shell 執行 `flowscope` 可能找不到命令；本次以臨時加入 `%APPDATA%\Python\Python313\Scripts` 驗證 entry point | 已記錄 |
-| 2 | 還原股價 `TaiwanStockPriceAdj` 由 FinMind 以最新除權息回算,**疑似 PIT 洩漏** | 所有技術面因子 | **Step 2 必驗**(Review Protocol §2.1 兩次取價比對);不通過則改用原始價自行 backward adjustment |
+| 2 | 還原股價 `TaiwanStockPriceAdj` 由 FinMind 以最新除權息回算,**疑似 PIT 洩漏** | 所有技術面因子 | Step 2 已處理:探測顯示不同 `end_date` 的重疊區間報酬率相同,但 API 無歷史 `as_of` 快照可證明基準日；正式 provider 不採用 `TaiwanStockPriceAdj`,改用原始價 + `TaiwanStockDividendResult` 且還原事件截止日不晚於查詢 `end/as_of` |
 | 3 | 集保頻率 2016 年前為月頻 | C05 及整個籌碼維度 | 見待決表 #14,實際可用起點暫定 2016-01 |
 
 ---
