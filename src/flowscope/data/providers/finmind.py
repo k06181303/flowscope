@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from calendar import monthrange
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -429,7 +430,7 @@ class FinMindProvider:
         start: date,
         end: date,
     ) -> pl.DataFrame:
-        market = self._get_market_value_shares(symbols, start, end)
+        market = self._get_market_value_shares(symbols, start, end, prices)
         balance = self._get_balance_sheet_shares(symbols, start - timedelta(days=730), end)
         balance_lookup = latest_balance_lookup(balance)
         market_lookup = {
@@ -468,6 +469,7 @@ class FinMindProvider:
         symbols: list[str],
         start: date,
         end: date,
+        prices: pl.DataFrame,
     ) -> pl.DataFrame:
         rows = self._fetch_dataset_for_symbols("TaiwanStockMarketValue", symbols, start, end)
         market = frame_from_rows(rows).with_columns(
@@ -475,7 +477,7 @@ class FinMindProvider:
             pl.col("date").str.strptime(pl.Date).alias("data_date"),
             pl.col("market_value").cast(pl.Float64),
         )
-        close = self._get_price_frame(symbols, start, end).select("symbol", "data_date", "close")
+        close = prices.select("symbol", "data_date", "close")
         return (
             market.join(close, on=["symbol", "data_date"], how="inner")
             .with_columns(
@@ -609,7 +611,9 @@ class FinMindProvider:
                 )
             rows.extend(daily_rows)
         wanted = set(symbols)
-        return [row for row in rows if str(row.get("stock_id")) in wanted]
+        filtered_rows = [row for row in rows if str(row.get("stock_id")) in wanted]
+        self._validate_holder_date_grid(filtered_rows, symbols, holder_dates)
+        return filtered_rows
 
     def _fetch_tdcc_payload_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
         payload = self._fetch_payload(request)
@@ -634,13 +638,41 @@ class FinMindProvider:
         start = request.start.isoformat() if request.start is not None else "none"
         end = request.end.isoformat() if request.end is not None else "none"
         filename = f"{request.dataset}_{symbol}_{start}_{end}.json"
+        if request.data_id is not None:
+            directory = self._tdcc_raw_root / "symbols" / request.data_id
+            self._write_tdcc_payload(directory / filename, payload)
+            return
         for data_date in data_dates:
             directory = self._tdcc_raw_root / data_date.isoformat()
-            directory.mkdir(parents=True, exist_ok=True)
-            (directory / filename).write_text(
-                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
-                encoding="utf-8",
-            )
+            self._write_tdcc_payload(directory / filename, payload)
+
+    def _write_tdcc_payload(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+
+    def _validate_holder_date_grid(
+        self,
+        rows: list[dict[str, Any]],
+        symbols: list[str],
+        expected_dates: list[date],
+    ) -> None:
+        expected = set(expected_dates)
+        for symbol in symbols:
+            actual = {
+                date.fromisoformat(str(row["date"]))
+                for row in rows
+                if str(row.get("stock_id")) == symbol
+            }
+            if actual != expected:
+                missing = sorted(expected - actual)
+                extra = sorted(actual - expected)
+                raise FinMindError(
+                    f"{TDCC_HOLDER_DATASET} holder date grid mismatch for {symbol}: "
+                    f"missing={format_dates(missing)}, extra={format_dates(extra)}"
+                )
 
     def _holder_publish_dates(self, data_dates: list[date], query_end: date) -> dict[date, date]:
         if not data_dates:
@@ -789,22 +821,30 @@ def align_holder_distribution_to_trading_days(
     daily_dates = [
         trading_date for trading_date in calendar.dates if start <= trading_date <= end
     ]
-    records: list[dict[str, object]] = []
-    for trading_date in daily_dates:
-        visible = holder_distribution.filter(pl.col("publish_date") <= trading_date)
-        if visible.is_empty():
-            continue
-        latest_dates = visible.group_by(["symbol", "tier"]).agg(pl.col("data_date").max())
-        latest = visible.join(latest_dates, on=["symbol", "tier", "data_date"], how="inner")
-        for row in latest.iter_rows(named=True):
-            enriched = dict(row)
-            enriched["as_of_date"] = trading_date
-            records.append(enriched)
-    if not records:
-        return holder_distribution.head(0).with_columns(
-            pl.lit(None, dtype=pl.Date).alias("as_of_date")
+    if not daily_dates:
+        return _empty_holder_daily_frame(holder_distribution)
+
+    calendar_frame = pl.DataFrame({"as_of_date": daily_dates}, schema={"as_of_date": pl.Date})
+    symbol_tiers = holder_distribution.select("symbol", "tier").unique()
+    left = symbol_tiers.join(calendar_frame, how="cross").sort(["as_of_date", "symbol", "tier"])
+    right = holder_distribution.sort(["publish_date", "symbol", "tier"])
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Sortedness of columns cannot be checked when 'by' groups provided",
+            category=UserWarning,
         )
-    return pl.DataFrame(records).select(
+        aligned = left.join_asof(
+            right,
+            left_on="as_of_date",
+            right_on="publish_date",
+            by=["symbol", "tier"],
+            strategy="backward",
+        )
+    aligned = aligned.filter(pl.col("data_date").is_not_null())
+    if aligned.is_empty():
+        return _empty_holder_daily_frame(holder_distribution)
+    return aligned.select(
         "symbol",
         "as_of_date",
         "data_date",
@@ -815,6 +855,27 @@ def align_holder_distribution_to_trading_days(
         "share_pct",
         "share_pct_sum",
         "share_pct_sum_ok",
+    )
+
+
+def _empty_holder_daily_frame(holder_distribution: pl.DataFrame) -> pl.DataFrame:
+    return (
+        holder_distribution.head(0)
+        .with_columns(
+            pl.lit(None, dtype=pl.Date).alias("as_of_date")
+        )
+        .select(
+            "symbol",
+            "as_of_date",
+            "data_date",
+            "publish_date",
+            "tier",
+            "holder_count",
+            "share_count",
+            "share_pct",
+            "share_pct_sum",
+            "share_pct_sum_ok",
+        )
     )
 
 

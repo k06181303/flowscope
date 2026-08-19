@@ -21,47 +21,54 @@ def backward_adjust_ohlcv(
         return raw
 
     events = _valid_adjustment_events(dividend_events, as_of)
-    if not events:
+    if events.is_empty():
         return raw
 
-    adjusted_rows: list[dict[str, object]] = []
-    for row in raw.sort(["symbol", "data_date"]).iter_rows(named=True):
-        symbol = str(row["symbol"])
-        data_date = _expect_date(row["data_date"], "data_date")
-        factor = 1.0
-        for event_symbol, event_date, ratio in events:
-            if event_symbol == symbol and data_date < event_date:
-                factor *= ratio
-        adjusted = dict(row)
-        for column in PRICE_COLUMNS:
-            value = row[column]
-            adjusted[column] = None if value is None else float(value) * factor
-        adjusted_rows.append(adjusted)
-
-    return pl.DataFrame(adjusted_rows, schema=raw.schema)
+    raw_with_id = raw.with_row_index("__row_id")
+    factors = (
+        raw_with_id.select("__row_id", "symbol", "data_date")
+        .join(events, on="symbol", how="inner")
+        .filter(pl.col("data_date") < pl.col("event_date"))
+        .group_by("__row_id")
+        .agg(pl.col("ratio").product().alias("__adjustment_factor"))
+    )
+    return (
+        raw_with_id.join(factors, on="__row_id", how="left")
+        .with_columns(pl.col("__adjustment_factor").fill_null(1.0))
+        .with_columns(
+            [
+                (pl.col(column).cast(pl.Float64) * pl.col("__adjustment_factor")).alias(column)
+                for column in PRICE_COLUMNS
+            ]
+        )
+        .drop("__row_id", "__adjustment_factor")
+        .select(raw.columns)
+    )
 
 
 def _valid_adjustment_events(
     dividend_events: pl.DataFrame,
     as_of: date,
-) -> list[tuple[str, date, float]]:
+) -> pl.DataFrame:
     required = {"symbol", "data_date", "before_price", "after_price"}
     missing = required - set(dividend_events.columns)
     if missing:
         joined = ", ".join(sorted(missing))
         raise ValueError(f"Dividend events are missing required columns: {joined}")
 
-    events: list[tuple[str, date, float]] = []
-    for row in dividend_events.sort(["symbol", "data_date"]).iter_rows(named=True):
-        event_date = _expect_date(row["data_date"], "data_date")
-        before = float(row["before_price"])
-        after = float(row["after_price"])
-        if event_date <= as_of and before > 0 and after > 0:
-            events.append((str(row["symbol"]), event_date, after / before))
-    return events
-
-
-def _expect_date(value: object, column: str) -> date:
-    if isinstance(value, date):
-        return value
-    raise TypeError(f"{column} must contain date values")
+    return (
+        dividend_events.with_columns(
+            pl.col("symbol").cast(pl.Utf8),
+            pl.col("data_date").alias("event_date"),
+            pl.col("before_price").cast(pl.Float64),
+            pl.col("after_price").cast(pl.Float64),
+        )
+        .filter(
+            (pl.col("event_date") <= as_of)
+            & (pl.col("before_price") > 0)
+            & (pl.col("after_price") > 0)
+        )
+        .with_columns((pl.col("after_price") / pl.col("before_price")).alias("ratio"))
+        .select("symbol", "event_date", "ratio")
+        .sort(["symbol", "event_date"])
+    )

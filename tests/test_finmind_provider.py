@@ -195,7 +195,7 @@ def test_provider_uses_one_bulk_request_per_trading_date_for_multiple_symbols(
     price_bulk_calls = [
         call for call in client.calls if call.dataset == "TaiwanStockPrice" and call.data_id is None
     ]
-    assert price_bulk_calls
+    assert len(price_bulk_calls) == 3
     assert all(call.start == call.end for call in price_bulk_calls)
     assert {call.start for call in price_bulk_calls} == {
         date(2024, 1, 2),
@@ -324,10 +324,8 @@ def test_get_holder_distribution_saves_raw_payload_by_data_date(tmp_path: Path) 
 
     provider.get_holder_distribution(["2330"], date(2024, 1, 5), date(2024, 1, 16))
 
-    first_raw_dir = tmp_path / "raw" / "tdcc" / "2024-01-05"
-    second_raw_dir = tmp_path / "raw" / "tdcc" / "2024-01-12"
-    assert list(first_raw_dir.glob("TaiwanStockHoldingSharesPer_2330_*.json"))
-    assert list(second_raw_dir.glob("TaiwanStockHoldingSharesPer_2330_*.json"))
+    raw_dir = tmp_path / "raw" / "tdcc" / "symbols" / "2330"
+    assert len(list(raw_dir.glob("TaiwanStockHoldingSharesPer_2330_*.json"))) == 1
 
 
 def test_holder_distribution_for_multiple_symbols_uses_bulk_per_holder_date(
@@ -349,6 +347,35 @@ def test_holder_distribution_for_multiple_symbols_uses_bulk_per_holder_date(
     ]
     assert {call.start for call in bulk_calls} == {date(2024, 1, 5), date(2024, 1, 12)}
     assert set(df["symbol"].to_list()) == {"2330", "2317"}
+    assert list((tmp_path / "raw" / "tdcc" / "2024-01-05").glob("*_ALL_*.json"))
+    assert list((tmp_path / "raw" / "tdcc" / "2024-01-12").glob("*_ALL_*.json"))
+
+
+def test_holder_distribution_raises_when_bulk_date_grid_misses_symbol(
+    tmp_path: Path,
+) -> None:
+    class MissingSymbolDateClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            if request.dataset == "TaiwanStockHoldingSharesPer" and request.data_id is None:
+                assert request.start is not None
+                rows = holder_rows("2330", request.start.isoformat())
+                if request.start == date(2024, 1, 5):
+                    rows += holder_rows("2317", request.start.isoformat())
+                return rows
+            return super().fetch_rows(request)
+
+    provider = FinMindProvider(
+        data_root=tmp_path,
+        no_cache=True,
+        client=MissingSymbolDateClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(FinMindError, match="holder date grid mismatch for 2317"):
+        provider.get_holder_distribution(
+            ["2330", "2317"],
+            date(2024, 1, 5),
+            date(2024, 1, 16),
+        )
 
 
 def test_holder_distribution_marks_bad_share_pct_sum(tmp_path: Path) -> None:
