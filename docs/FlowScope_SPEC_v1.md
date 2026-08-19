@@ -13,6 +13,7 @@
 | 2026-08-18 | §6.2 | 集保級距改以**股數下界**判定,不再依賴 tier 編號 | 原表 tier 編號與集保官方差 1,且與同節 `retail_pct = tier 1..3` 自相矛盾 |
 | 2026-08-18 | §8.5 | 取消台股整張(1000 股)限制,允許零股 | 使用者裁定(§14-1) |
 | 2026-08-19 | §3 | 目錄結構同步:`finmind.py` 涵蓋集保,`tdcc.py` 標註為 Phase 2 備援不建立 | 同上,補漏 |
+| 2026-08-19 | §4.2 | 除權息還原改為 `as_of` 基準,不得使用 `as_of` 之後才發生或才公開的事件回算歷史 | Step 2 審查指出「以最新價為基準」與 PIT 原則矛盾;使用者裁定直接修訂 SPEC |
 
 詳細查證見 `docs/FinMind_API_Inventory.md`;人類裁定紀錄見 `PROGRESS.md`。
 
@@ -203,7 +204,7 @@ def as_of_filter(df: pl.DataFrame, as_of: date) -> pl.DataFrame:
 
 ### 4.2 台股特有的資料清理
 
-1. **除權息還原**:價格因子一律使用還原價 (adjusted)。但**成交量與市值使用原始值**。還原方式採用向後調整 (backward adjustment),以最新價為基準。
+1. **除權息還原**:價格因子一律使用還原價 (adjusted)。但**成交量與市值使用原始值**。還原方式採用向後調整 (backward adjustment),基準日不得晚於 `as_of`;只能使用 `publish_date <= as_of` 且除權息基準日不晚於 `as_of` 的事件,不得用最新除權息資料回算歷史。
 2. **下市/暫停交易股票必須保留在歷史資料中**。建構 `as_of` 當日的股票池時,依 `listing_date <= as_of < delisting_date` 篩選。若 provider 不提供下市清單,必須在 README 中明確記錄此為已知的倖存者偏差來源。
 3. **股票代號變更 / 合併**:維護 `data/processed/symbol_map.parquet`,欄位 `(old_id, new_id, effective_date)`。
 4. **處置股 / 全額交割股 / 注意股**:必須抓取並在 Gate 排除(見 §5.2)。
