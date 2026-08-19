@@ -11,6 +11,7 @@ from flowscope.data.calendar import TradingCalendar
 from flowscope.universe.gates import GateApplication, GateStep, apply_l0_gates, apply_l1_gates
 
 LISTING_DAY_LOOKBACK_CALENDAR_DAYS = 500
+FINANCIAL_LOOKBACK_CALENDAR_DAYS = 730
 
 
 class PriceDataProvider(Protocol):
@@ -20,13 +21,13 @@ class PriceDataProvider(Protocol):
 
     def get_market_values(self, symbols: list[str], start: date, end: date) -> pl.DataFrame: ...
 
+    def get_financials(self, symbols: list[str], start: date, end: date) -> pl.DataFrame: ...
+
 
 class MarketMetaProvider(Protocol):
     def get_listings(self, as_of: date) -> pl.DataFrame: ...
 
     def get_warnings(self, as_of: date) -> pl.DataFrame: ...
-
-    def get_financial_snapshot(self, as_of: date) -> pl.DataFrame: ...
 
 
 @dataclass(frozen=True)
@@ -70,11 +71,19 @@ def build_universe_funnel(
 
     l0_symbols = [str(symbol) for symbol in l0.frame["symbol"]]
     warnings = market_provider.get_warnings(as_of)
-    financials = market_provider.get_financial_snapshot(as_of)
     market_values = (
         data_provider.get_market_values(l0_symbols, latest_trade_date, latest_trade_date)
         if l0_symbols
         else empty_market_values()
+    )
+    financials = (
+        data_provider.get_financials(
+            l0_symbols,
+            as_of - timedelta(days=FINANCIAL_LOOKBACK_CALENDAR_DAYS),
+            as_of,
+        )
+        if l0_symbols
+        else empty_financials()
     )
     l1 = apply_l1_gates(l0.frame, warnings, financials, market_values, config.gates.l1)
     return UniverseFunnel(
@@ -113,6 +122,19 @@ def empty_market_values() -> pl.DataFrame:
             "data_date": pl.Date,
             "publish_date": pl.Date,
             "market_value": pl.Float64,
+        }
+    )
+
+
+def empty_financials() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "symbol": pl.Utf8,
+            "data_date": pl.Date,
+            "publish_date": pl.Date,
+            "statement": pl.Utf8,
+            "type": pl.Utf8,
+            "value": pl.Float64,
         }
     )
 

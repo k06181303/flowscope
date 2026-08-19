@@ -40,14 +40,6 @@ WARNING_ENDPOINTS = (
     OfficialEndpoint("TPEX", "tpex_altered_trading", f"{TPEX_BASE_URL}/tpex_cmode"),
 )
 
-FINANCIAL_ENDPOINTS = (
-    OfficialEndpoint("TWSE", "twse_income_general", f"{TWSE_BASE_URL}/opendata/t187ap06_L_ci"),
-    OfficialEndpoint("TWSE", "twse_balance_general", f"{TWSE_BASE_URL}/opendata/t187ap07_L_ci"),
-    OfficialEndpoint("TPEX", "tpex_income_general", f"{TPEX_BASE_URL}/mopsfin_t187ap06_O_ci"),
-    OfficialEndpoint("TPEX", "tpex_balance_general", f"{TPEX_BASE_URL}/mopsfin_t187ap07_O_ci"),
-)
-
-
 class OfficialOpenApiClient:
     def fetch_rows(self, url: str) -> list[dict[str, Any]]:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -105,27 +97,6 @@ class OfficialMarketProvider:
         if raw_source_count == 0:
             raise OfficialMarketDataError("Official warning endpoints returned no source rows")
         return warning_frame(rows)
-
-    def get_financial_snapshot(self, as_of: date) -> pl.DataFrame:
-        income_rows: list[dict[str, object]] = []
-        balance_rows: list[dict[str, object]] = []
-        for endpoint in FINANCIAL_ENDPOINTS:
-            rows = self._client.fetch_rows(endpoint.url)
-            if "income" in endpoint.source:
-                income_rows.extend(parse_income_rows(endpoint, rows, as_of))
-            else:
-                balance_rows.extend(parse_balance_rows(endpoint, rows, as_of))
-        if not income_rows or not balance_rows:
-            raise OfficialMarketDataError("Official financial snapshot returned no usable rows")
-
-        income = latest_period_frame(pl.DataFrame(income_rows))
-        balance = latest_period_frame(pl.DataFrame(balance_rows))
-        joined = balance.join(
-            income.drop("publish_date"),
-            on=["symbol", "fiscal_year", "fiscal_quarter"],
-            how="inner",
-        )
-        return joined.filter(pl.col("publish_date") <= as_of).sort("symbol")
 
 
 def parse_listing_row(
@@ -252,94 +223,6 @@ def warning_frame(rows: list[dict[str, object]]) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=schema).unique().sort(["symbol", "warning_type"])
 
 
-def parse_income_rows(
-    endpoint: OfficialEndpoint,
-    rows: list[dict[str, Any]],
-    as_of: date,
-) -> list[dict[str, object]]:
-    parsed: list[dict[str, object]] = []
-    for row in rows:
-        symbol = code_for_market(endpoint, row)
-        fiscal = fiscal_period(row)
-        publish_date = row_publish_date(row, as_of)
-        if symbol is None or fiscal is None or publish_date > as_of:
-            continue
-        year, quarter = fiscal
-        parsed.append(
-            {
-                "symbol": symbol,
-                "fiscal_year": year,
-                "fiscal_quarter": quarter,
-                "publish_date": publish_date,
-                "revenue": parse_number(row_value(row, ("營業收入",), 5)),
-                "operating_income": parse_number(row_value(row, ("營業利益（損失）",), 15)),
-                "net_income": parse_number(row_value(row, ("本期淨利（淨損）",), 22)),
-            }
-        )
-    return parsed
-
-
-def parse_balance_rows(
-    endpoint: OfficialEndpoint,
-    rows: list[dict[str, Any]],
-    as_of: date,
-) -> list[dict[str, object]]:
-    parsed: list[dict[str, object]] = []
-    for row in rows:
-        symbol = code_for_market(endpoint, row)
-        fiscal = fiscal_period(row)
-        publish_date = row_publish_date(row, as_of)
-        if symbol is None or fiscal is None or publish_date > as_of:
-            continue
-        year, quarter = fiscal
-        parsed.append(
-            {
-                "symbol": symbol,
-                "fiscal_year": year,
-                "fiscal_quarter": quarter,
-                "publish_date": publish_date,
-                "current_assets": parse_number(row_value(row, ("流動資產",), 5)),
-                "total_assets": parse_number(row_value(row, ("資產總計",), 7)),
-                "current_liabilities": parse_number(row_value(row, ("流動負債",), 8)),
-                "total_liabilities": parse_number(row_value(row, ("負債總計",), 10)),
-                "retained_earnings": parse_number(row_value(row, ("保留盈餘",), 14)),
-            }
-        )
-    return parsed
-
-
-def latest_period_frame(frame: pl.DataFrame) -> pl.DataFrame:
-    return (
-        frame.sort(["symbol", "publish_date", "fiscal_year", "fiscal_quarter"])
-        .group_by("symbol")
-        .tail(1)
-    )
-
-
-def code_for_market(endpoint: OfficialEndpoint, row: dict[str, Any]) -> str | None:
-    if endpoint.market == "TWSE":
-        return normalize_symbol(row_value(row, ("公司代號",), 3))
-    return normalize_symbol(row_value(row, ("SecuritiesCompanyCode",), 3))
-
-
-def fiscal_period(row: dict[str, Any]) -> tuple[int, int] | None:
-    year_value = row_value(row, ("年度", "Year"), 1)
-    quarter_value = row_value(row, ("季別", "Season"), 2)
-    try:
-        year = int(str(year_value)) + 1911
-        quarter = int(str(quarter_value))
-    except (TypeError, ValueError):
-        return None
-    if quarter not in {1, 2, 3, 4}:
-        return None
-    return year, quarter
-
-
-def row_publish_date(row: dict[str, Any], fallback: date) -> date:
-    raw = str(row_value(row, ("出表日期", "Date"), 0) or "")
-    return parse_roc_compact(raw) or fallback
-
-
 def row_value(row: dict[str, Any], keys: tuple[str, ...], position: int) -> object | None:
     for key in keys:
         if key in row:
@@ -355,18 +238,6 @@ def normalize_symbol(value: object) -> str | None:
     if not symbol:
         return None
     return symbol
-
-
-def parse_number(value: object) -> float | None:
-    if value is None:
-        return None
-    text = str(value).replace(",", "").strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
 
 
 def parse_yyyymmdd(text: str) -> date | None:

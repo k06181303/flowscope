@@ -5,11 +5,7 @@ from typing import Any
 
 import pytest
 
-from flowscope.data.providers.twse import (
-    OfficialMarketDataError,
-    OfficialMarketProvider,
-    parse_number,
-)
+from flowscope.data.providers.twse import OfficialMarketDataError, OfficialMarketProvider
 
 
 class StaticOfficialClient:
@@ -63,34 +59,6 @@ class StaticOfficialClient:
                     "SuspensionOfTrading": "N",
                 }
             ]
-        if url.endswith("t187ap06_L_ci"):
-            return [
-                {
-                    "公司代號": "2330",
-                    "年度": "113",
-                    "季別": "1",
-                    "出表日期": "1130515",
-                    "營業收入": "1,000",
-                    "營業利益（損失）": "200",
-                    "本期淨利（淨損）": "150",
-                }
-            ]
-        if url.endswith("t187ap07_L_ci"):
-            return [
-                {
-                    "公司代號": "2330",
-                    "年度": "113",
-                    "季別": "1",
-                    "出表日期": "1130515",
-                    "流動資產": "500",
-                    "資產總計": "2,000",
-                    "流動負債": "300",
-                    "負債總計": "800",
-                    "保留盈餘": "600",
-                }
-            ]
-        if url.endswith("mopsfin_t187ap06_O_ci") or url.endswith("mopsfin_t187ap07_O_ci"):
-            return []
         raise AssertionError(f"unexpected url {url}")
 
 
@@ -115,16 +83,6 @@ def test_official_provider_drops_placeholder_warning_rows_and_keeps_active_flags
         ("2330", "disposition", date(2024, 1, 3)),
         ("6488", "attention", date(2024, 1, 4)),
         ("8069", "altered_trading", date(2024, 8, 18)),
-    ]
-
-
-def test_official_provider_parses_latest_financial_snapshot() -> None:
-    provider = OfficialMarketProvider(client=StaticOfficialClient())  # type: ignore[arg-type]
-
-    df = provider.get_financial_snapshot(date(2024, 8, 18))
-
-    assert df.select("symbol", "publish_date", "total_assets", "operating_income").rows() == [
-        ("2330", date(2024, 5, 15), 2000.0, 200.0)
     ]
 
 
@@ -154,68 +112,14 @@ def test_official_provider_uses_position_fallback_for_mojibake_twse_keys() -> No
                 ]
             if url.endswith("mopsfin_t187ap03_O"):
                 return []
-            if url.endswith("t187ap06_L_ci"):
-                return [
-                    {
-                        "k0": "1130515",
-                        "k1": "113",
-                        "k2": "1",
-                        "k3": "2330",
-                        "k4": "台積電",
-                        "k5": "1000",
-                        "k6": "0",
-                        "k7": "",
-                        "k8": "",
-                        "k9": "",
-                        "k10": "",
-                        "k11": "",
-                        "k12": "",
-                        "k13": "",
-                        "k14": "",
-                        "k15": "200",
-                        "k16": "",
-                        "k17": "",
-                        "k18": "",
-                        "k19": "",
-                        "k20": "",
-                        "k21": "",
-                        "k22": "150",
-                    }
-                ]
-            if url.endswith("t187ap07_L_ci"):
-                return [
-                    {
-                        "k0": "1130515",
-                        "k1": "113",
-                        "k2": "1",
-                        "k3": "2330",
-                        "k4": "台積電",
-                        "k5": "500",
-                        "k6": "",
-                        "k7": "2000",
-                        "k8": "300",
-                        "k9": "",
-                        "k10": "800",
-                        "k11": "",
-                        "k12": "",
-                        "k13": "",
-                        "k14": "600",
-                    }
-                ]
-            if url.endswith("mopsfin_t187ap06_O_ci") or url.endswith("mopsfin_t187ap07_O_ci"):
-                return []
             return super().fetch_rows(url)
 
     provider = OfficialMarketProvider(client=MojibakeTwseClient())  # type: ignore[arg-type]
 
     listings = provider.get_listings(date(2024, 8, 18))
-    financials = provider.get_financial_snapshot(date(2024, 8, 18))
 
     assert listings.select("symbol", "name", "industry", "listing_date").rows() == [
         ("2330", "台積電", "24", date(1994, 9, 5))
-    ]
-    assert financials.select("symbol", "revenue", "operating_income", "total_assets").rows() == [
-        ("2330", 1000.0, 200.0, 2000.0)
     ]
 
 
@@ -230,8 +134,3 @@ def test_official_provider_rejects_empty_listings() -> None:
 
     with pytest.raises(OfficialMarketDataError, match="no usable rows"):
         provider.get_listings(date(2024, 8, 18))
-
-
-def test_parse_number_preserves_zero() -> None:
-    assert parse_number(0) == 0.0
-    assert parse_number("0") == 0.0

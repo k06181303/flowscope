@@ -9,8 +9,78 @@ import polars as pl
 from flowscope.config.schema import L0GateConfig, L1GateConfig
 from flowscope.data.calendar import TradingCalendar
 
-MARKET_VALUE_UNIT_SCALE = 1000.0
-NONMANUFACTURING_MARKERS = frozenset({"金融", "保險", "證券", "期貨", "17"})
+MARKET_VALUE_UNIT_SCALE = 1.0
+TWSE_NONMANUFACTURING_INDUSTRY_CODES = frozenset(
+    {
+        "14",  # 建材營造
+        "15",  # 航運
+        "16",  # 觀光餐旅
+        "17",  # 金融保險
+        "18",  # 貿易百貨
+        "20",  # 其他
+        "23",  # 油電燃氣
+        "29",  # 電子通路
+        "30",  # 資訊服務
+        "32",  # 文化創意
+        "34",  # 電子商務
+        "36",  # 數位雲端
+        "37",  # 運動休閒
+        "38",  # 居家生活
+    }
+)
+TPEX_NONMANUFACTURING_INDUSTRY_CODES = frozenset(
+    {
+        "14",  # 建材營造
+        "15",  # 航運
+        "16",  # 觀光餐旅
+        "17",  # 金融保險
+        "18",  # 貿易百貨
+        "20",  # 其他
+        "23",  # 油電燃氣
+        "29",  # 電子通路
+        "30",  # 資訊服務
+        "32",  # 文化創意
+        "34",  # 電子商務
+        "36",  # 數位雲端
+        "37",  # 運動休閒
+        "38",  # 居家生活
+    }
+)
+NONMANUFACTURING_TEXT_MARKERS = frozenset(
+    {
+        "金融",
+        "保險",
+        "證券",
+        "期貨",
+        "建材",
+        "營造",
+        "航運",
+        "觀光",
+        "餐旅",
+        "貿易",
+        "百貨",
+        "油電",
+        "燃氣",
+        "電子通路",
+        "資訊服務",
+        "文化創意",
+        "電子商務",
+        "數位雲端",
+        "運動休閒",
+        "居家生活",
+    }
+)
+FINANCIAL_TYPE_ALIASES = {
+    "CurrentAssets": "current_assets",
+    "TotalAssets": "total_assets",
+    "CurrentLiabilities": "current_liabilities",
+    "Liabilities": "total_liabilities",
+    "RetainedEarnings": "retained_earnings",
+    "OperatingIncome": "operating_income",
+    "Revenue": "revenue",
+    "CashFlowsFromOperatingActivities": "operating_cash_flow",
+    "NetCashInflowFromOperatingActivities": "operating_cash_flow",
+}
 
 
 class UniverseGateError(RuntimeError):
@@ -119,7 +189,7 @@ def apply_l1_gates(
     market_values: pl.DataFrame,
     config: L1GateConfig,
 ) -> GateApplication:
-    ensure_columns(universe, {"symbol", "industry"}, "universe")
+    ensure_columns(universe, {"symbol", "market", "industry"}, "universe")
     ensure_columns(warnings, {"symbol", "warning_type"}, "warnings")
     ensure_columns(market_values, {"symbol", "market_value"}, "market_values")
 
@@ -130,6 +200,7 @@ def apply_l1_gates(
         .tail(1)
         .select(
             "symbol",
+            # Step 4 L1 財務已改用 FinMind long format；財報與市值皆為元級。
             (pl.col("market_value") / MARKET_VALUE_UNIT_SCALE).alias("market_value_statement_unit"),
         )
     )
@@ -156,20 +227,20 @@ def apply_l1_gates(
         pl.col("altman_z").is_null() | (pl.col("altman_z") >= pl.col("altman_z_threshold")),
         steps,
     )
-    frame = apply_filter(
-        frame,
-        "L1 negative_ocf",
-        pl.col("negative_ocf_quarters").is_null()
-        | (pl.col("negative_ocf_quarters") <= config.max_negative_ocf_quarters),
-        steps,
-    )
-    frame = apply_filter(
-        frame,
-        "L1 capital_raise",
-        pl.col("capital_raise_pct").is_null()
-        | (pl.col("capital_raise_pct") <= config.max_capital_raise_pct),
-        steps,
-    )
+    if has_non_null_values(frame, "negative_ocf_quarters"):
+        frame = apply_filter(
+            frame,
+            "L1 negative_ocf",
+            pl.col("negative_ocf_quarters") <= config.max_negative_ocf_quarters,
+            steps,
+        )
+    if has_non_null_values(frame, "capital_raise_pct"):
+        frame = apply_filter(
+            frame,
+            "L1 capital_raise",
+            pl.col("capital_raise_pct") <= config.max_capital_raise_pct,
+            steps,
+        )
     return GateApplication(frame=frame.sort("symbol"), steps=tuple(steps))
 
 
@@ -204,8 +275,25 @@ def price_metrics(
 def latest_financials(financials: pl.DataFrame) -> pl.DataFrame:
     if financials.is_empty():
         return empty_latest_financials()
-    ensure_columns(financials, {"symbol", "publish_date"}, "financials")
-    return financials.sort(["symbol", "publish_date"]).group_by("symbol").tail(1)
+    ensure_columns(
+        financials,
+        {"symbol", "data_date", "publish_date", "type", "value"},
+        "financials",
+    )
+    normalized = normalize_financial_long_frame(financials)
+    if normalized.is_empty():
+        return empty_latest_financials()
+    latest_columns_to_drop = (
+        ["operating_cash_flow"] if "operating_cash_flow" in normalized.columns else []
+    )
+    latest = (
+        normalized.sort(["symbol", "publish_date", "data_date"])
+        .group_by("symbol")
+        .tail(1)
+        .drop(latest_columns_to_drop)
+    )
+    negative_ocf = negative_ocf_quarters(normalized)
+    return latest.join(negative_ocf, on="symbol", how="left")
 
 
 def empty_latest_financials() -> pl.DataFrame:
@@ -220,6 +308,7 @@ def empty_latest_financials() -> pl.DataFrame:
             "retained_earnings": pl.Float64,
             "operating_income": pl.Float64,
             "revenue": pl.Float64,
+            "negative_ocf_quarters": pl.Int64,
         }
     )
 
@@ -238,8 +327,8 @@ def with_altman_z(frame: pl.DataFrame, config: L1GateConfig) -> pl.DataFrame:
         if column not in frame.columns:
             frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
 
-    is_nonmanufacturing = pl.col("industry").cast(pl.Utf8).map_elements(
-        is_nonmanufacturing_industry,
+    is_nonmanufacturing = pl.struct(["market", "industry"]).map_elements(
+        lambda row: is_nonmanufacturing_industry(str(row["market"]), str(row["industry"])),
         return_dtype=pl.Boolean,
     )
     x1 = (pl.col("current_assets") - pl.col("current_liabilities")) / pl.col("total_assets")
@@ -292,6 +381,76 @@ def with_optional_l1_fields(frame: pl.DataFrame, config: L1GateConfig) -> pl.Dat
     )
 
 
+def normalize_financial_long_frame(financials: pl.DataFrame) -> pl.DataFrame:
+    records: list[dict[str, object]] = []
+    for row in financials.iter_rows(named=True):
+        alias = FINANCIAL_TYPE_ALIASES.get(str(row["type"]))
+        if alias is None:
+            continue
+        data_date = row["data_date"]
+        publish_date = row["publish_date"]
+        if not isinstance(data_date, date) or not isinstance(publish_date, date):
+            raise UniverseGateError("financials data_date/publish_date must contain date values")
+        records.append(
+            {
+                "symbol": str(row["symbol"]),
+                "data_date": data_date,
+                "publish_date": publish_date,
+                "field": alias,
+                "value": float(row["value"]),
+            }
+        )
+    if not records:
+        return empty_normalized_financials()
+    return (
+        pl.DataFrame(records)
+        .pivot(
+            index=["symbol", "data_date", "publish_date"],
+            on="field",
+            values="value",
+            aggregate_function="first",
+        )
+        .sort(["symbol", "data_date"])
+    )
+
+
+def empty_normalized_financials() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "symbol": pl.Utf8,
+            "data_date": pl.Date,
+            "publish_date": pl.Date,
+            "current_assets": pl.Float64,
+            "total_assets": pl.Float64,
+            "current_liabilities": pl.Float64,
+            "total_liabilities": pl.Float64,
+            "retained_earnings": pl.Float64,
+            "operating_income": pl.Float64,
+            "revenue": pl.Float64,
+            "operating_cash_flow": pl.Float64,
+        }
+    )
+
+
+def negative_ocf_quarters(financials: pl.DataFrame) -> pl.DataFrame:
+    if "operating_cash_flow" not in financials.columns:
+        return pl.DataFrame(schema={"symbol": pl.Utf8, "negative_ocf_quarters": pl.Int64})
+    records: list[dict[str, object]] = []
+    for (symbol,), group in financials.sort(["symbol", "data_date"]).group_by("symbol"):
+        count = 0
+        rows = list(group.iter_rows(named=True))
+        for row in reversed(rows):
+            value = row.get("operating_cash_flow")
+            if value is None:
+                continue
+            if float(value) < 0:
+                count += 1
+                continue
+            break
+        records.append({"symbol": str(symbol), "negative_ocf_quarters": count})
+    return pl.DataFrame(records, schema={"symbol": pl.Utf8, "negative_ocf_quarters": pl.Int64})
+
+
 def apply_filter(
     frame: pl.DataFrame,
     name: str,
@@ -311,8 +470,17 @@ def listing_trading_days(row: dict[str, Any], calendar: TradingCalendar, as_of: 
     return calendar.count_between(listing_date, as_of)
 
 
-def is_nonmanufacturing_industry(industry: str) -> bool:
-    return any(marker in industry for marker in NONMANUFACTURING_MARKERS)
+def is_nonmanufacturing_industry(market: str, industry: str) -> bool:
+    code = industry.strip().zfill(2) if industry.strip().isdigit() else industry.strip()
+    if market == "TWSE" and code in TWSE_NONMANUFACTURING_INDUSTRY_CODES:
+        return True
+    if market == "TPEX" and code in TPEX_NONMANUFACTURING_INDUSTRY_CODES:
+        return True
+    return any(marker in industry for marker in NONMANUFACTURING_TEXT_MARKERS)
+
+
+def has_non_null_values(frame: pl.DataFrame, column: str) -> bool:
+    return column in frame.columns and frame.select(pl.col(column).is_not_null().any()).item()
 
 
 def ensure_columns(frame: pl.DataFrame, columns: set[str], label: str) -> None:

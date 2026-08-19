@@ -10,7 +10,13 @@ from flowscope.config.loader import load_config
 from flowscope.config.schema import L0GateConfig, L1GateConfig
 from flowscope.data.calendar import TradingCalendar
 from flowscope.universe.builder import UniverseFunnel, build_universe_funnel, render_funnel
-from flowscope.universe.gates import GateApplication, GateStep, apply_l0_gates, apply_l1_gates
+from flowscope.universe.gates import (
+    GateApplication,
+    GateStep,
+    apply_l0_gates,
+    apply_l1_gates,
+    is_nonmanufacturing_industry,
+)
 
 
 def test_l0_gates_are_applied_in_spec_order() -> None:
@@ -88,13 +94,51 @@ def test_l1_altman_uses_manufacturing_and_nonmanufacturing_models() -> None:
         ("L1 warning_disposition_full_delivery", 4, 3),
         ("L1 altman_z", 3, 2),
         ("L1 negative_ocf", 2, 2),
-        ("L1 capital_raise", 2, 2),
     ]
     scores = dict(l1.frame.select("symbol", "altman_z").rows())
     # MFG: 1.2*0.1 + 1.4*0.3 + 3.3*0.1 + 0.6*2.5 + 1.0*0.5 = 2.87
     assert scores["MFG"] == pytest.approx(2.87)
     # FIN: 6.56*0.7 + 3.26*0.1 + 6.72*0.05 + 1.05*1.0 = 6.304
     assert scores["FIN"] == pytest.approx(6.304)
+
+
+def test_l1_nonmanufacturing_industry_codes_cover_twse_and_tpex_tables() -> None:
+    codes = ("14", "15", "16", "17", "18", "20", "23", "29", "30", "32", "34", "36", "37", "38")
+    for code in codes:
+        assert is_nonmanufacturing_industry("TWSE", code)
+        assert is_nonmanufacturing_industry("TPEX", code)
+    assert not is_nonmanufacturing_industry("TWSE", "24")
+    assert not is_nonmanufacturing_industry("TPEX", "24")
+
+
+def test_l1_negative_ocf_uses_cash_flow_statement_and_removes_symbol() -> None:
+    l1 = apply_l1_gates(
+        pl.DataFrame(
+            [
+                listing("MFG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24"),
+                listing("NEG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24"),
+            ]
+        ),
+        empty_warnings(),
+        pl.DataFrame(
+            financial_records("MFG")
+            + financial_records("NEG", operating_cash_flows=(-1.0, -2.0))
+        ),
+        pl.DataFrame(
+            [
+                {"symbol": "MFG", "data_date": date(2024, 1, 20), "market_value": 2000.0},
+                {"symbol": "NEG", "data_date": date(2024, 1, 20), "market_value": 2000.0},
+            ]
+        ),
+        l1_config(),
+    )
+
+    assert [(step.name, step.before, step.after) for step in l1.steps] == [
+        ("L1 warning_disposition_full_delivery", 2, 2),
+        ("L1 altman_z", 2, 2),
+        ("L1 negative_ocf", 2, 1),
+    ]
+    assert l1.frame["symbol"].to_list() == ["MFG"]
 
 
 def test_l1_beneish_missing_is_flagged_not_zero() -> None:
@@ -186,45 +230,83 @@ def price_rows(
 
 def financial_rows() -> pl.DataFrame:
     return pl.DataFrame(
-        [
-            financial("MFG", 500.0, 2000.0, 300.0, 800.0, 600.0, 200.0, 1000.0),
-            financial("FIN", 800.0, 1000.0, 100.0, 500.0, 100.0, 50.0, None),
-            financial("BAD", 100.0, 2000.0, 100.0, 1800.0, 0.0, -100.0, 100.0),
-            financial("WARN", 500.0, 2000.0, 300.0, 800.0, 600.0, 200.0, 1000.0),
-        ]
+        financial_records("MFG")
+        + financial_records(
+            "FIN",
+            current_assets=800.0,
+            total_assets=1000.0,
+            current_liabilities=100.0,
+            total_liabilities=500.0,
+            retained_earnings=100.0,
+            operating_income=50.0,
+            revenue=None,
+        )
+        + financial_records(
+            "BAD",
+            current_assets=100.0,
+            total_assets=2000.0,
+            current_liabilities=100.0,
+            total_liabilities=1800.0,
+            retained_earnings=0.0,
+            operating_income=-100.0,
+            revenue=100.0,
+        )
+        + financial_records("WARN")
     )
 
 
-def financial(
+def financial_records(
     symbol: str,
-    current_assets: float,
-    total_assets: float,
-    current_liabilities: float,
-    total_liabilities: float,
-    retained_earnings: float,
-    operating_income: float,
-    revenue: float | None,
-) -> dict[str, object]:
-    return {
-        "symbol": symbol,
-        "publish_date": date(2024, 5, 15),
-        "current_assets": current_assets,
-        "total_assets": total_assets,
-        "current_liabilities": current_liabilities,
-        "total_liabilities": total_liabilities,
-        "retained_earnings": retained_earnings,
-        "operating_income": operating_income,
-        "revenue": revenue,
-    }
+    current_assets: float = 500.0,
+    total_assets: float = 2000.0,
+    current_liabilities: float = 300.0,
+    total_liabilities: float = 800.0,
+    retained_earnings: float = 600.0,
+    operating_income: float = 200.0,
+    revenue: float | None = 1000.0,
+    operating_cash_flows: tuple[float, float] = (100.0, 120.0),
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for period, ocf in zip(
+        (date(2023, 12, 31), date(2024, 3, 31)),
+        operating_cash_flows,
+        strict=True,
+    ):
+        publish_date = date(2024, 3, 15) if period.month == 12 else date(2024, 5, 15)
+        values = {
+            "CurrentAssets": current_assets,
+            "TotalAssets": total_assets,
+            "CurrentLiabilities": current_liabilities,
+            "Liabilities": total_liabilities,
+            "RetainedEarnings": retained_earnings,
+            "OperatingIncome": operating_income,
+            "Revenue": revenue,
+            "CashFlowsFromOperatingActivities": ocf,
+        }
+        rows.extend(
+            {
+                "symbol": symbol,
+                "data_date": period,
+                "publish_date": publish_date,
+                "statement": (
+                    "cash_flow" if key == "CashFlowsFromOperatingActivities" else "statement"
+                ),
+                "type": key,
+                "value": value,
+            }
+            for key, value in values.items()
+            if value is not None
+        )
+    return rows
 
 
 def market_values() -> pl.DataFrame:
     return pl.DataFrame(
         [
-            {"symbol": "MFG", "data_date": date(2024, 1, 20), "market_value": 2_000_000.0},
-            {"symbol": "FIN", "data_date": date(2024, 1, 20), "market_value": 500_000.0},
-            {"symbol": "BAD", "data_date": date(2024, 1, 20), "market_value": 1_000.0},
-            {"symbol": "WARN", "data_date": date(2024, 1, 20), "market_value": 2_000_000.0},
+            {"symbol": "MFG", "data_date": date(2024, 1, 20), "market_value": 2000.0},
+            {"symbol": "FIN", "data_date": date(2024, 1, 20), "market_value": 500.0},
+            {"symbol": "BAD", "data_date": date(2024, 1, 20), "market_value": 1.0},
+            {"symbol": "WARN", "data_date": date(2024, 1, 20), "market_value": 2000.0},
         ]
     )
 
@@ -273,10 +355,13 @@ class StaticPriceProvider:
                     "symbol": symbols[0],
                     "data_date": end,
                     "publish_date": end,
-                    "market_value": 2_000_000.0,
+                    "market_value": 2000.0,
                 }
             ]
         )
+
+    def get_financials(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
+        return financial_rows().filter(pl.col("symbol").is_in(symbols))
 
 
 class StaticMarketProvider:
@@ -287,6 +372,3 @@ class StaticMarketProvider:
 
     def get_warnings(self, as_of: date) -> pl.DataFrame:
         return empty_warnings()
-
-    def get_financial_snapshot(self, as_of: date) -> pl.DataFrame:
-        return financial_rows().filter(pl.col("symbol") == "MFG")

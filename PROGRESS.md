@@ -10,7 +10,7 @@
 
 下一步:審查通過後進入 SPEC §13 **Step 5 — 技術面因子 T01–T21**
 
-DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。真實 smoke: `as_of=2026-08-19` 全市場 1,985 → L0 749 → L1 577 → Top N 30。
+DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。Step 4 補修後 L0 維持正確: `as_of=2026-08-19` 全市場 1,985 → L0 749；L1 財務來源已改 FinMind,全市場 L1 需先建立財報快取後重跑。
 
 ---
 
@@ -48,6 +48,9 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。真實 smoke: 
 | 4 | 歷史 as_of 的完整 PIT universe 尚未完成 | TWSE/TPEx 官方上市櫃清單是目前快照；可支援 `as_of` 當日 active listing 篩選,但無法還原已下市且仍在歷史 as_of 活躍的股票之 listing_date/industry。`TaiwanStockDelisting` 可補下市日,但缺 listing_date/industry 歷史 | 是，Step 5 前若只跑 current-as-of 可接受；進入任何歷史回測或 forward log 驗證前必補 |
 | 4 | L1 的會計師意見、財報延遲申報、董監質押比未實作 | 待決表 #10/#12 已裁定 Phase 1 不實作會計師意見與董監質押；#11 尚待接公開資訊觀測站來源。不得用預設值假裝通過 | 是，#11 在接來源後補；#10/#12 依 Phase 1 裁定維持揭露缺口 |
 | 4 | Beneish M-score 只標記缺資料,尚未計算 | SPEC §5.2 說 Beneish 是 flag 非 exclusion；完整 M-score 需要跨期財報欄位與 Step 7 財務因子資料整理。目前缺輸入時輸出 `null` 並設 `beneish_m_unavailable` | 是，Step 7 財務因子補齊跨期輸入後實作 |
+| 4 | `capital_raise` gate 暫停顯示為 active step | FinMind 三表目前未提供可直接驗證的「一年內現金增資規模」欄位；用股本或資本公積變化會混入非現金/股票股利等事件,不符合 SPEC 的現金增資語意 | 是，找到 MOPS/TWSE 可驗證現金增資來源後補；在此之前不得顯示成刷 0 檔的 gate |
+| 4 | 「資料完整度 >= 門檻」階段目前是 pass-through | Step 8 才會有因子 raw/normalized 值與 missing ratio,Step 4 尚無資料完整度可計算 | 是，Step 8 scoring/missing 處理完成後接上 |
+| 4 | L0 `security_type` / `exclude_markets` 兩關目前實測各刷 0 檔 | 官方 listing provider 目前只接 TWSE/TPEx 上市櫃普通股清單,未納入 ETF/ETN/REIT/TDR/特別股與興櫃；因此這兩關保留 config 驅動邏輯,但 current source 下無可刷標的 | 是，若後續 listing provider 擴大到 ETF/興櫃來源,這兩關會開始生效 |
 
 ---
 
@@ -91,8 +94,10 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。真實 smoke: 
 | 7 | `shares_outstanding` 交叉驗證容忍值原本固定 0.5% 並直接 raise | Step 2 price provider | 已修正:差異 ≤ 0.5% 時採 balance sheet 股本；差異 > 0.5% 時發出 `RuntimeWarning` 並改用同日 `TaiwanStockMarketValue / close` 的 PIT 推導值,避免季中資本變動被季報股本延遲誤殺 |
 | 8 | 舊 cache 目錄 `data/raw/finmind/finmind/` | 本機資料目錄 | 已確認不存在(`Test-Path` 回傳 `False`)。這是舊版 cache root bug 產物,目前程式不會再產生 |
 | 9 | TWSE OpenAPI 部分資料集回傳 mojibake 欄位名 | 官方上市櫃清單與財報 snapshot parser | 已處理:正常中文/英文 key 優先,若不存在則依官方欄位順序 fallback；測試覆蓋 mojibake/位置 fallback |
-| 10 | 官方財報 OpenAPI 只提供目前 snapshot,不提供歷史季度查詢 | 歷史 `as_of` 的 Altman Z L1 gate | current-as-of smoke 可用；`as_of=2026-08-18` 會因官方財報出表日 2026-08-19 被 PIT 過濾而中止。歷史 as_of 應改用 FinMind 財報 long format pivot,但全市場逐檔請求約需數千 requests |
-| 11 | Step 4 真實 smoke 的 L1 刷掉 172 檔,略高於 Review Protocol 50–150 參考區間 | Step 4 審查 | L0 749 落在 500–900 合理區間；L1 172 主要來自官方注意/處置/全額交割 + Altman 排除。先保留,不得為湊數調 Gate 參數 |
+| 10 | 官方財報 OpenAPI 只提供目前 snapshot,不提供歷史季度查詢 | 歷史 `as_of` 的 Altman Z L1 gate | 已修正:Step 4 L1 財務來源改用 FinMind `get_financials()` long format pivot,沿用 Step 2 Q4 +75d / 其餘 +45d 的 `publish_date` 推導；TWSE/TPEx official provider 僅保留 listing/warnings |
+| 11 | 非製造業分類原本只命中 `17` 金融保險 | Altman Z'' 分流 | 已修正:TWSE/TPEx 分別建立非製造業代碼表,涵蓋 14/15/16/17/18/20/23/29/30/32/34/36/37/38；`as_of=2026-08-19` current listing 命中 548/1,985 = 27.6% |
+| 12 | 全市場預設 L1 改用 FinMind 財報後,首次無快取執行成本很高 | Step 4 全市場 smoke 與歷史 smoke | FinMind 三個財報 dataset 實測 `data_id=None` 皆回 0 筆,必須逐檔抓。L0 749 檔約需 2,247 requests,Backer 1,600 req/hr 下至少約 84 分鐘。已以 2330 單檔真實 API 驗證 2024-08-19 / 2025-08-19 / 2026-08-19 三個歷史 `as_of` 均可產出 funnel；全市場 L1 數字待財報快取建立後重跑 |
+| 13 | FinMind 財報與官方 OpenAPI 財報單位不同 | Altman X4 | 已修正:Step 4 既已改用 FinMind 財報,市值與財報都用元級,不再將 `market_value` 除以 1,000。單檔 smoke 確認 2330 不再被 Altman 單位錯誤剔除 |
 
 ---
 
@@ -104,3 +109,4 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。真實 smoke: 
 | 2026-08-19 | 2 | CONDITIONAL | 需補多檔逐日期抓取、財報逐檔抓取、法人欄位改名防呆、借券餘額揭露、SPEC §4.2 矛盾揭露 |
 | 2026-08-19 | 3 | 待審查 | 已補 FinMind 集保 provider、原始 JSON 保存、級距下界解析、比例合計標記、公布日交易日對齊與日頻 PIT forward fill；Non-blocking 建議已補 raw payload 去重、日頻對齊向量化、seed/bulk 日期網格防呆、重複抓價與 adjustment loop |
 | 2026-08-19 | 4 | 待審查 | 已補 official market provider、L0/L1 gate、funnel CLI 與測試；已揭露 symbol_map、完整歷史 PIT universe 與部分 L1 資料源缺口 |
+| 2026-08-19 | 4 | CONDITIONAL | 需補非製造業代碼表、L1 改用 FinMind 財報、negative OCF 真正接現金流量表、揭露 capital_raise/資料完整度/L0 零刷關卡 |
