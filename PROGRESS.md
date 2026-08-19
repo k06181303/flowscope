@@ -6,11 +6,11 @@
 
 ## 目前狀態
 
-**Step 3 完成,待審查。**
+**Step 4 完成,待審查。**
 
-下一步:審查通過後進入 SPEC §13 **Step 4 — Universe + L0/L1 Gate + 漏斗輸出**
+下一步:審查通過後進入 SPEC §13 **Step 5 — 技術面因子 T01–T21**
 
-DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d` 並向後對齊交易日;`tests/test_pit.py` 通過
+DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。真實 smoke: `as_of=2026-08-19` 全市場 1,985 → L0 749 → L1 577 → Top N 30。
 
 ---
 
@@ -21,6 +21,7 @@ DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d
 | 1 | 專案骨架、config schema、CLI 空殼 | 2026-08-18 | 是 | `step-1: initialize project skeleton` |
 | 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer`;`step-2: fix FinMind batching safeguards` |
 | 3 | 集保 provider (FinMind) + 解析 + PIT 對齊 | 2026-08-19 | 是 | `step-3: implement FinMind holder distribution`;`step-3: tighten holder data safeguards` |
+| 4 | Universe + L0/L1 Gate + 漏斗輸出 | 2026-08-19 | 是 | `step-4: implement universe gates and funnel` |
 
 ---
 
@@ -43,6 +44,10 @@ DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d
 | 3 | 集保官網爬蟲與原始 HTML/CSV 保存 | SPEC 已於 2026-08-18 修訂:Phase 1 集保來源改為 FinMind `TaiwanStockHoldingSharesPer`;集保官網爬蟲降級 Phase 2 備援 | 否，除非 Phase 2 啟用備援爬蟲 |
 | 3 | C01–C17 籌碼因子計算 | Step 3 只做資料層、解析與 PIT 對齊；SPEC §13 將籌碼因子列為 Step 6 | 是，Step 6 補做 |
 | 3 | 自動化對照集保官網近期頁面 | 本步已保留 FinMind 原始 JSON 並以真實 API 驗證級距解析與比例合計；官方網站人工抽查屬審查手動驗算項，尚未寫入自動測試 | 建議 Step 3 審查時由審查者抽查近 3 週 `big_holder_pct` |
+| 4 | `data/processed/symbol_map.parquet` 尚未建立 | Step 4 已可用官方 TWSE/TPEx OpenAPI 建構 current-as-of universe；但 SPEC §4.2 #3 的代號變更/合併映射需要可驗證的官方事件來源。FinMind `TaiwanStockDelisting` 只有下市日與代號,不足以重建改名/合併映射；建立空 parquet 會造成假完成感 | 是，接歷史回測/manifest 前必須補官方 symbol event source 並寫入 parquet |
+| 4 | 歷史 as_of 的完整 PIT universe 尚未完成 | TWSE/TPEx 官方上市櫃清單是目前快照；可支援 `as_of` 當日 active listing 篩選,但無法還原已下市且仍在歷史 as_of 活躍的股票之 listing_date/industry。`TaiwanStockDelisting` 可補下市日,但缺 listing_date/industry 歷史 | 是，Step 5 前若只跑 current-as-of 可接受；進入任何歷史回測或 forward log 驗證前必補 |
+| 4 | L1 的會計師意見、財報延遲申報、董監質押比未實作 | 待決表 #10/#12 已裁定 Phase 1 不實作會計師意見與董監質押；#11 尚待接公開資訊觀測站來源。不得用預設值假裝通過 | 是，#11 在接來源後補；#10/#12 依 Phase 1 裁定維持揭露缺口 |
+| 4 | Beneish M-score 只標記缺資料,尚未計算 | SPEC §5.2 說 Beneish 是 flag 非 exclusion；完整 M-score 需要跨期財報欄位與 Step 7 財務因子資料整理。目前缺輸入時輸出 `null` 並設 `beneish_m_unavailable` | 是，Step 7 財務因子補齊跨期輸入後實作 |
 
 ---
 
@@ -85,6 +90,9 @@ DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d
 | 6 | 集保全市場回補需用逐資料日 bulk,不可逐檔 | Step 3 holder provider | 實測 `TaiwanStockHoldingSharesPer data_id=None` 只回 `start_date` 當日全市場。實作採單檔區間請求；多檔先用第一檔找出資料日,再逐資料日 bulk。2 年全市場約 100–110 個 holder data-date requests,Backer 1,600 req/hr 下約 4–5 分鐘,另加一次 seed request與重試/快取開銷 |
 | 7 | `shares_outstanding` 交叉驗證容忍值原本固定 0.5% 並直接 raise | Step 2 price provider | 已修正:差異 ≤ 0.5% 時採 balance sheet 股本；差異 > 0.5% 時發出 `RuntimeWarning` 並改用同日 `TaiwanStockMarketValue / close` 的 PIT 推導值,避免季中資本變動被季報股本延遲誤殺 |
 | 8 | 舊 cache 目錄 `data/raw/finmind/finmind/` | 本機資料目錄 | 已確認不存在(`Test-Path` 回傳 `False`)。這是舊版 cache root bug 產物,目前程式不會再產生 |
+| 9 | TWSE OpenAPI 部分資料集回傳 mojibake 欄位名 | 官方上市櫃清單與財報 snapshot parser | 已處理:正常中文/英文 key 優先,若不存在則依官方欄位順序 fallback；測試覆蓋 mojibake/位置 fallback |
+| 10 | 官方財報 OpenAPI 只提供目前 snapshot,不提供歷史季度查詢 | 歷史 `as_of` 的 Altman Z L1 gate | current-as-of smoke 可用；`as_of=2026-08-18` 會因官方財報出表日 2026-08-19 被 PIT 過濾而中止。歷史 as_of 應改用 FinMind 財報 long format pivot,但全市場逐檔請求約需數千 requests |
+| 11 | Step 4 真實 smoke 的 L1 刷掉 172 檔,略高於 Review Protocol 50–150 參考區間 | Step 4 審查 | L0 749 落在 500–900 合理區間；L1 172 主要來自官方注意/處置/全額交割 + Altman 排除。先保留,不得為湊數調 Gate 參數 |
 
 ---
 
@@ -95,3 +103,4 @@ DoD:可取得任一股票 2 年週頻股權分散;`publish_date = data_date + 7d
 | 2026-08-18 | 1 | CONDITIONAL | 需補跳過揭露、factor params 驗證、distribution warning 門檻驗證 |
 | 2026-08-19 | 2 | CONDITIONAL | 需補多檔逐日期抓取、財報逐檔抓取、法人欄位改名防呆、借券餘額揭露、SPEC §4.2 矛盾揭露 |
 | 2026-08-19 | 3 | 待審查 | 已補 FinMind 集保 provider、原始 JSON 保存、級距下界解析、比例合計標記、公布日交易日對齊與日頻 PIT forward fill；Non-blocking 建議已補 raw payload 去重、日頻對齊向量化、seed/bulk 日期網格防呆、重複抓價與 adjustment loop |
+| 2026-08-19 | 4 | 待審查 | 已補 official market provider、L0/L1 gate、funnel CLI 與測試；已揭露 symbol_map、完整歷史 PIT universe 與部分 L1 資料源缺口 |

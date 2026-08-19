@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date
 
@@ -36,6 +36,26 @@ class TradingCalendar:
         if index >= len(self.dates):
             raise ValueError(f"No trading date on or after {value.isoformat()}")
         return self.dates[index]
+
+    def on_or_before(self, value: date) -> date:
+        index = bisect_right(self.dates, value) - 1
+        if index < 0:
+            raise ValueError(f"No trading date on or before {value.isoformat()}")
+        return self.dates[index]
+
+    def count_between(self, start: date, end: date) -> int:
+        if start > end:
+            return 0
+        left = bisect_left(self.dates, start)
+        right = bisect_right(self.dates, end)
+        return right - left
+
+    def trailing_dates(self, end: date, days: int) -> tuple[date, ...]:
+        if days <= 0:
+            raise ValueError("days must be positive")
+        end_index = bisect_right(self.dates, end)
+        start_index = max(0, end_index - days)
+        return self.dates[start_index:end_index]
 
     def add_trading_days(self, value: date, days: int) -> date:
         if days < 0:

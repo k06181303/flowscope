@@ -8,6 +8,9 @@ import typer
 
 from flowscope.config.loader import load_config_with_hash
 from flowscope.data.providers.finmind import FinMindError, FinMindProvider
+from flowscope.data.providers.twse import OfficialMarketDataError, OfficialMarketProvider
+from flowscope.universe.builder import build_universe_funnel, render_funnel
+from flowscope.universe.gates import UniverseGateError
 
 app = typer.Typer(
     help="FlowScope Taiwan stock selection and trade plan generator.",
@@ -159,15 +162,39 @@ def sensitivity(
 
 @diagnose_app.command()
 def funnel(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to a FlowScope YAML config.",
+        ),
+    ] = Path("configs/tw_swing.yaml"),
     as_of: Annotated[
         str | None,
         typer.Option("--as-of", help="Point-in-time execution date."),
     ] = None,
+    no_cache: Annotated[
+        bool,
+        typer.Option("--no-cache", help="Bypass local data cache."),
+    ] = False,
 ) -> None:
-    parsed_as_of = _parse_iso_date(as_of, "--as-of")
-    if parsed_as_of is not None:
-        typer.echo(f"as_of={parsed_as_of}")
-    _step_message("diagnose funnel")
+    loaded = load_config_with_hash(config)
+    parsed_as_of = _parse_date(as_of, "--as-of") or date.today()
+    try:
+        report = build_universe_funnel(
+            loaded.config,
+            parsed_as_of,
+            FinMindProvider(no_cache=no_cache),
+            OfficialMarketProvider(),
+        )
+    except (FinMindError, OfficialMarketDataError, UniverseGateError) as exc:
+        typer.secho(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(render_funnel(report))
 
 
 @app.command()

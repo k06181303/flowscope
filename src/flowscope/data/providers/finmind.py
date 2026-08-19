@@ -174,6 +174,35 @@ class FinMindProvider:
 
         return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
 
+    def get_price_history(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
+        validate_symbols(symbols)
+        key = cache_key("get_price_history", symbols, start, end)
+
+        def fetch() -> pl.DataFrame:
+            return self._get_price_frame(symbols, start, end)
+
+        return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+
+    def get_market_values(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
+        validate_symbols(symbols)
+        key = cache_key("get_market_values", symbols, start, end)
+
+        def fetch() -> pl.DataFrame:
+            rows = self._fetch_dataset_for_symbols("TaiwanStockMarketValue", symbols, start, end)
+            return (
+                frame_from_rows(rows)
+                .with_columns(
+                    pl.col("stock_id").cast(pl.Utf8).alias("symbol"),
+                    pl.col("date").str.strptime(pl.Date).alias("data_date"),
+                    pl.col("market_value").cast(pl.Float64),
+                )
+                .with_columns(pl.col("data_date").alias("publish_date"))
+                .select("symbol", "data_date", "publish_date", "market_value")
+                .sort(["symbol", "data_date"])
+            )
+
+        return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+
     def get_trading_calendar(self, start: date, end: date) -> TradingCalendar:
         key = cache_key("get_trading_calendar", ["ALL"], start, end)
 
@@ -713,7 +742,15 @@ class FinMindProvider:
         start: date | None,
         end: date | None,
     ) -> list[dict[str, Any]]:
-        return self._client.fetch_rows(FinMindRequest(dataset, data_id, start, end))
+        request = FinMindRequest(dataset, data_id, start, end)
+        try:
+            return self._client.fetch_rows(request)
+        except FinMindError as exc:
+            raise FinMindError(
+                f"{dataset} request failed: data_id={data_id or 'ALL'}, "
+                f"start={start.isoformat() if start is not None else 'none'}, "
+                f"end={end.isoformat() if end is not None else 'none'}: {exc}"
+            ) from exc
 
 
 def load_finmind_token(env_path: Path = Path(".env")) -> str:

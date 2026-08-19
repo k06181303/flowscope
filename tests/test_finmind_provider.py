@@ -204,6 +204,38 @@ def test_provider_uses_one_bulk_request_per_trading_date_for_multiple_symbols(
     }
 
 
+def test_get_price_history_returns_raw_prices_without_share_lookup(tmp_path: Path) -> None:
+    client = StaticClient()
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=client)  # type: ignore[arg-type]
+
+    df = provider.get_price_history(["2330", "2317"], date(2024, 1, 2), date(2024, 1, 4))
+
+    assert "shares_outstanding" not in df.columns
+    assert df.select("symbol", "data_date", "close").rows() == [
+        ("2317", date(2024, 1, 2), 200.0),
+        ("2317", date(2024, 1, 3), 200.0),
+        ("2317", date(2024, 1, 4), 200.0),
+        ("2330", date(2024, 1, 2), 100.0),
+        ("2330", date(2024, 1, 3), 100.0),
+        ("2330", date(2024, 1, 4), 100.0),
+    ]
+    assert not any(call.dataset == "TaiwanStockBalanceSheet" for call in client.calls)
+
+
+def test_get_market_values_maps_publish_date(tmp_path: Path) -> None:
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=StaticClient())  # type: ignore[arg-type]
+
+    df = provider.get_market_values(["2330"], date(2024, 1, 2), date(2024, 1, 4))
+
+    assert df.columns == ["symbol", "data_date", "publish_date", "market_value"]
+    assert df["publish_date"].to_list() == [
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+    ]
+    assert df["market_value"].to_list() == pytest.approx([100_000.0, 110_000.0, 90_000.0])
+
+
 def test_daily_bulk_fetch_raises_when_returned_dates_do_not_match_calendar(
     tmp_path: Path,
 ) -> None:

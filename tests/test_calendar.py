@@ -13,6 +13,9 @@ def test_trading_calendar_uses_supplied_dates_not_weekend_rules() -> None:
 
     assert calendar.contains(date(2024, 1, 6))
     assert calendar.on_or_after(date(2024, 1, 4)) == date(2024, 1, 6)
+    assert calendar.on_or_before(date(2024, 1, 4)) == date(2024, 1, 3)
+    assert calendar.count_between(date(2024, 1, 2), date(2024, 1, 5)) == 2
+    assert calendar.trailing_dates(date(2024, 1, 6), 2) == (date(2024, 1, 3), date(2024, 1, 6))
     assert calendar.add_trading_days(date(2024, 1, 2), 2) == date(2024, 1, 6)
 
 
