@@ -12,6 +12,7 @@
 | 2026-08-18 | §4.3、§4.4、§13 Step 3 | 集保股權分散表改由 FinMind `TaiwanStockHoldingSharesPer` 取得;集保官網爬蟲降級為 Phase 2 備援 | 使用者裁定(§14-2 選項 A)。FinMind 該 dataset 自 2010-01-29 起,集保官網僅保留約 1 年 |
 | 2026-08-18 | §6.2 | 集保級距改以**股數下界**判定,不再依賴 tier 編號 | 原表 tier 編號與集保官方差 1,且與同節 `retail_pct = tier 1..3` 自相矛盾 |
 | 2026-08-18 | §8.5 | 取消台股整張(1000 股)限制,允許零股 | 使用者裁定(§14-1) |
+| 2026-08-19 | §3 | 目錄結構同步:`finmind.py` 涵蓋集保,`tdcc.py` 標註為 Phase 2 備援不建立 | 同上,補漏 |
 
 詳細查證見 `docs/FinMind_API_Inventory.md`;人類裁定紀錄見 `PROGRESS.md`。
 
@@ -124,9 +125,9 @@ flowscope/
 │   │   ├── calendar.py            # 交易日曆
 │   │   ├── adjust.py              # 除權息還原
 │   │   └── providers/
-│   │       ├── finmind.py
-│   │       ├── tdcc.py            # 集保股權分散表(爬蟲)
-│   │       └── twse.py            # 官方公開資料補充
+│   │       ├── finmind.py         # 主要來源(含集保股權分散表)
+│   │       ├── tdcc.py            # (2026-08-18 修訂) 集保官網爬蟲,Phase 2 備援,Phase 1 不建立
+│   │       └── twse.py            # 官方公開資料補充(注意股/全額交割等 FinMind 缺口)
 │   ├── universe/
 │   │   ├── builder.py             # 建構 point-in-time 股票池
 │   │   └── gates.py               # L0 / L1 閘門
