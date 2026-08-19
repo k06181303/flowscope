@@ -74,7 +74,10 @@ def test_official_provider_rebuilds_current_listing_snapshot() -> None:
 
 
 def test_official_provider_drops_placeholder_warning_rows_and_keeps_active_flags() -> None:
-    provider = OfficialMarketProvider(client=StaticOfficialClient())  # type: ignore[arg-type]
+    provider = OfficialMarketProvider(  # type: ignore[arg-type]
+        client=StaticOfficialClient(),
+        today=date(2024, 8, 18),
+    )
 
     df = provider.get_warnings(date(2024, 8, 18))
 
@@ -84,6 +87,32 @@ def test_official_provider_drops_placeholder_warning_rows_and_keeps_active_flags
         ("6488", "attention", date(2024, 1, 4)),
         ("8069", "altered_trading", date(2024, 8, 18)),
     ]
+
+
+def test_official_provider_rejects_historical_warning_snapshot() -> None:
+    provider = OfficialMarketProvider(  # type: ignore[arg-type]
+        client=StaticOfficialClient(),
+        today=date(2026, 8, 20),
+    )
+
+    with pytest.raises(OfficialMarketDataError, match="historical as_of=2025-08-19"):
+        provider.get_warnings(date(2025, 8, 19))
+
+
+def test_official_provider_rejects_dated_warning_row_without_source_date() -> None:
+    class MissingDateClient(StaticOfficialClient):
+        def fetch_rows(self, url: str) -> list[dict[str, Any]]:
+            if url.endswith("announcement/notice"):
+                return [{"Code": "2330", "TradingInfoForAttention": "注意"}]
+            return super().fetch_rows(url)
+
+    provider = OfficialMarketProvider(  # type: ignore[arg-type]
+        client=MissingDateClient(),
+        today=date(2024, 8, 18),
+    )
+
+    with pytest.raises(OfficialMarketDataError, match="has no valid source date"):
+        provider.get_warnings(date(2024, 8, 18))
 
 
 def test_official_provider_uses_position_fallback_for_mojibake_twse_keys() -> None:

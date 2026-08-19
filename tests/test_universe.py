@@ -16,6 +16,7 @@ from flowscope.universe.gates import (
     apply_l0_gates,
     apply_l1_gates,
     is_nonmanufacturing_industry,
+    latest_financials,
 )
 
 
@@ -94,6 +95,7 @@ def test_l1_altman_uses_manufacturing_and_nonmanufacturing_models() -> None:
         ("L1 warning_disposition_full_delivery", 4, 3),
         ("L1 altman_z", 3, 2),
         ("L1 negative_ocf", 2, 2),
+        ("L1 capital_raise", 2, 2),
     ]
     scores = dict(l1.frame.select("symbol", "altman_z").rows())
     # MFG: 1.2*0.1 + 1.4*0.3 + 3.3*0.1 + 0.6*2.5 + 1.0*0.5 = 2.87
@@ -111,23 +113,30 @@ def test_l1_nonmanufacturing_industry_codes_cover_twse_and_tpex_tables() -> None
     assert not is_nonmanufacturing_industry("TPEX", "24")
 
 
-def test_l1_negative_ocf_uses_cash_flow_statement_and_removes_symbol() -> None:
+def test_l1_negative_ocf_converts_positive_cumulative_values_to_negative_quarters() -> None:
+    financials = pl.DataFrame(
+        financial_records("HEALTHY")
+        + financial_records("BURN", operating_cash_flows=(500.0, 400.0, 300.0, 200.0))
+    )
+    counts = dict(
+        latest_financials(financials).select("symbol", "negative_ocf_quarters").rows()
+    )
+    # 獨立手算:500, 400-500, 300-400, 200-300 = 500, -100, -100, -100。
+    assert counts["BURN"] == 3
+
     l1 = apply_l1_gates(
         pl.DataFrame(
             [
-                listing("MFG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24"),
-                listing("NEG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24"),
+                listing("HEALTHY", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24"),
+                listing("BURN", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24"),
             ]
         ),
         empty_warnings(),
-        pl.DataFrame(
-            financial_records("MFG")
-            + financial_records("NEG", operating_cash_flows=(-1.0, -2.0))
-        ),
+        financials,
         pl.DataFrame(
             [
-                {"symbol": "MFG", "data_date": date(2024, 1, 20), "market_value": 2000.0},
-                {"symbol": "NEG", "data_date": date(2024, 1, 20), "market_value": 2000.0},
+                {"symbol": "HEALTHY", "data_date": date(2024, 1, 20), "market_value": 2000.0},
+                {"symbol": "BURN", "data_date": date(2024, 1, 20), "market_value": 2000.0},
             ]
         ),
         l1_config(),
@@ -137,8 +146,59 @@ def test_l1_negative_ocf_uses_cash_flow_statement_and_removes_symbol() -> None:
         ("L1 warning_disposition_full_delivery", 2, 2),
         ("L1 altman_z", 2, 2),
         ("L1 negative_ocf", 2, 1),
+        ("L1 capital_raise", 1, 1),
     ]
-    assert l1.frame["symbol"].to_list() == ["MFG"]
+    assert l1.steps[-1].skipped_reason == "no data"
+    assert l1.frame["symbol"].to_list() == ["HEALTHY"]
+
+
+def test_l1_negative_ocf_detects_latest_positive_quarter_from_negative_cumulative() -> None:
+    financials = pl.DataFrame(
+        financial_records(
+            "RECOVERED",
+            operating_cash_flows=(-100.0, -200.0, -300.0, -295.0),
+        )
+    )
+
+    row = latest_financials(financials).row(0, named=True)
+
+    # 獨立手算:-100, -100, -100, +5；最新一季已轉正，所以連續負季數為 0。
+    assert row["negative_ocf_quarters"] == 0
+
+
+def test_l1_negative_ocf_streak_does_not_cross_fiscal_year() -> None:
+    financials = pl.DataFrame(
+        financial_records(
+            "YEAR_BOUNDARY",
+            periods=(date(2024, 12, 31), date(2025, 3, 31)),
+            operating_cash_flows=(-100.0, -50.0),
+        )
+    )
+
+    row = latest_financials(financials).row(0, named=True)
+
+    assert row["negative_ocf_quarters"] == 1
+
+
+def test_l1_altman_uses_four_quarter_ttm_and_rejects_short_history() -> None:
+    full = pl.DataFrame(
+        financial_records(
+            "TTM",
+            quarterly_operating_incomes=(10.0, 20.0, 30.0, 40.0),
+            quarterly_revenues=(100.0, 200.0, 300.0, 400.0),
+        )
+    )
+    short = full.filter(pl.col("data_date") > date(2024, 3, 31)).with_columns(
+        pl.lit("SHORT").alias("symbol")
+    )
+    latest = latest_financials(pl.concat([full, short]))
+    rows = {row["symbol"]: row for row in latest.iter_rows(named=True)}
+
+    # 獨立手算:EBIT TTM=10+20+30+40=100；Sales TTM=100+200+300+400=1,000。
+    assert rows["TTM"]["operating_income_ttm"] == pytest.approx(100.0)
+    assert rows["TTM"]["revenue_ttm"] == pytest.approx(1000.0)
+    assert rows["SHORT"]["operating_income_ttm"] is None
+    assert rows["SHORT"]["revenue_ttm"] is None
 
 
 def test_l1_beneish_missing_is_flagged_not_zero() -> None:
@@ -154,6 +214,25 @@ def test_l1_beneish_missing_is_flagged_not_zero() -> None:
     assert row["beneish_m_score"] is None
     assert row["beneish_m_unavailable"] is True
     assert row["beneish_m_flagged"] is False
+
+
+def test_l1_gates_disclose_skipped_when_optional_source_has_no_data() -> None:
+    financials = financial_rows().filter(pl.col("statement") != "cash_flow")
+
+    l1 = apply_l1_gates(
+        pl.DataFrame(
+            [listing("MFG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24")]
+        ),
+        empty_warnings(),
+        financials.filter(pl.col("symbol") == "MFG"),
+        market_values().filter(pl.col("symbol") == "MFG"),
+        l1_config(),
+    )
+
+    assert [(step.name, step.skipped_reason) for step in l1.steps[-2:]] == [
+        ("L1 negative_ocf", "no data"),
+        ("L1 capital_raise", "no data"),
+    ]
 
 
 def test_render_funnel_matches_spec_shape() -> None:
@@ -174,6 +253,24 @@ def test_render_funnel_matches_spec_shape() -> None:
         "  資料完整度 >= 門檻        △      0  ->    589",
         "  評分後 Top N                      ->     30",
     ]
+
+
+def test_render_funnel_discloses_gate_skipped_for_no_data() -> None:
+    funnel = UniverseFunnel(
+        as_of=date(2024, 8, 18),
+        market="TW",
+        initial_count=1,
+        l0=GateApplication(pl.DataFrame({"symbol": ["A"]}), ()),
+        l1=GateApplication(
+            pl.DataFrame({"symbol": ["A"]}),
+            (GateStep("L1 capital_raise", 1, 1, skipped_reason="no data"),),
+        ),
+        top_n=1,
+    )
+
+    assert render_funnel(funnel).splitlines()[-1].strip() == (
+        "L1 capital_raise               skipped (no data)"
+    )
 
 
 def test_builder_fetches_exact_trailing_20_trading_days_for_l0() -> None:
@@ -264,23 +361,39 @@ def financial_records(
     retained_earnings: float = 600.0,
     operating_income: float = 200.0,
     revenue: float | None = 1000.0,
-    operating_cash_flows: tuple[float, float] = (100.0, 120.0),
+    periods: tuple[date, ...] = (
+        date(2024, 3, 31),
+        date(2024, 6, 30),
+        date(2024, 9, 30),
+        date(2024, 12, 31),
+    ),
+    operating_cash_flows: tuple[float, ...] = (100.0, 220.0, 350.0, 500.0),
+    quarterly_operating_incomes: tuple[float, ...] | None = None,
+    quarterly_revenues: tuple[float, ...] | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for period, ocf in zip(
-        (date(2023, 12, 31), date(2024, 3, 31)),
+    income_values = quarterly_operating_incomes or tuple(
+        operating_income / len(periods) for _ in periods
+    )
+    revenue_values = quarterly_revenues or tuple(
+        None if revenue is None else revenue / len(periods) for _ in periods
+    )
+    for period, ocf, quarter_income, quarter_revenue in zip(
+        periods,
         operating_cash_flows,
+        income_values,
+        revenue_values,
         strict=True,
     ):
-        publish_date = date(2024, 3, 15) if period.month == 12 else date(2024, 5, 15)
+        publish_date = period + timedelta(days=75 if period.month == 12 else 45)
         values = {
             "CurrentAssets": current_assets,
             "TotalAssets": total_assets,
             "CurrentLiabilities": current_liabilities,
             "Liabilities": total_liabilities,
             "RetainedEarnings": retained_earnings,
-            "OperatingIncome": operating_income,
-            "Revenue": revenue,
+            "OperatingIncome": quarter_income,
+            "Revenue": quarter_revenue,
             "CashFlowsFromOperatingActivities": ocf,
         }
         rows.extend(

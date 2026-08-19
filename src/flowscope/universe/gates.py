@@ -9,7 +9,6 @@ import polars as pl
 from flowscope.config.schema import L0GateConfig, L1GateConfig
 from flowscope.data.calendar import TradingCalendar
 
-MARKET_VALUE_UNIT_SCALE = 1.0
 TWSE_NONMANUFACTURING_INDUSTRY_CODES = frozenset(
     {
         "14",  # 建材營造
@@ -92,6 +91,7 @@ class GateStep:
     name: str
     before: int
     after: int
+    skipped_reason: str | None = None
 
     @property
     def removed(self) -> int:
@@ -201,7 +201,7 @@ def apply_l1_gates(
         .select(
             "symbol",
             # Step 4 L1 財務已改用 FinMind long format；財報與市值皆為元級。
-            (pl.col("market_value") / MARKET_VALUE_UNIT_SCALE).alias("market_value_statement_unit"),
+            pl.col("market_value").alias("market_value_statement_unit"),
         )
     )
     warning_flags = warning_symbols.with_columns(pl.lit(True).alias("is_warning_symbol"))
@@ -227,20 +227,26 @@ def apply_l1_gates(
         pl.col("altman_z").is_null() | (pl.col("altman_z") >= pl.col("altman_z_threshold")),
         steps,
     )
-    if has_non_null_values(frame, "negative_ocf_quarters"):
+    if column_has_data(frame, "negative_ocf_quarters"):
         frame = apply_filter(
             frame,
             "L1 negative_ocf",
-            pl.col("negative_ocf_quarters") <= config.max_negative_ocf_quarters,
+            pl.col("negative_ocf_quarters").is_null()
+            | (pl.col("negative_ocf_quarters") <= config.max_negative_ocf_quarters),
             steps,
         )
-    if has_non_null_values(frame, "capital_raise_pct"):
+    else:
+        append_skipped_step(frame, "L1 negative_ocf", steps)
+    if column_has_data(frame, "capital_raise_pct"):
         frame = apply_filter(
             frame,
             "L1 capital_raise",
-            pl.col("capital_raise_pct") <= config.max_capital_raise_pct,
+            pl.col("capital_raise_pct").is_null()
+            | (pl.col("capital_raise_pct") <= config.max_capital_raise_pct),
             steps,
         )
+    else:
+        append_skipped_step(frame, "L1 capital_raise", steps)
     return GateApplication(frame=frame.sort("symbol"), steps=tuple(steps))
 
 
@@ -283,17 +289,28 @@ def latest_financials(financials: pl.DataFrame) -> pl.DataFrame:
     normalized = normalize_financial_long_frame(financials)
     if normalized.is_empty():
         return empty_latest_financials()
-    latest_columns_to_drop = (
-        ["operating_cash_flow"] if "operating_cash_flow" in normalized.columns else []
-    )
     latest = (
         normalized.sort(["symbol", "publish_date", "data_date"])
         .group_by("symbol")
         .tail(1)
-        .drop(latest_columns_to_drop)
+        .select(
+            "symbol",
+            "data_date",
+            "publish_date",
+            "current_assets",
+            "total_assets",
+            "current_liabilities",
+            "total_liabilities",
+            "retained_earnings",
+        )
     )
+    ttm_income = trailing_twelve_month_income(normalized)
     negative_ocf = negative_ocf_quarters(normalized)
-    return latest.join(negative_ocf, on="symbol", how="left")
+    return latest.join(ttm_income, on="symbol", how="left").join(
+        negative_ocf,
+        on="symbol",
+        how="left",
+    )
 
 
 def empty_latest_financials() -> pl.DataFrame:
@@ -306,8 +323,8 @@ def empty_latest_financials() -> pl.DataFrame:
             "current_liabilities": pl.Float64,
             "total_liabilities": pl.Float64,
             "retained_earnings": pl.Float64,
-            "operating_income": pl.Float64,
-            "revenue": pl.Float64,
+            "operating_income_ttm": pl.Float64,
+            "revenue_ttm": pl.Float64,
             "negative_ocf_quarters": pl.Int64,
         }
     )
@@ -320,8 +337,8 @@ def with_altman_z(frame: pl.DataFrame, config: L1GateConfig) -> pl.DataFrame:
         "current_liabilities",
         "total_liabilities",
         "retained_earnings",
-        "operating_income",
-        "revenue",
+        "operating_income_ttm",
+        "revenue_ttm",
         "market_value_statement_unit",
     ):
         if column not in frame.columns:
@@ -333,9 +350,9 @@ def with_altman_z(frame: pl.DataFrame, config: L1GateConfig) -> pl.DataFrame:
     )
     x1 = (pl.col("current_assets") - pl.col("current_liabilities")) / pl.col("total_assets")
     x2 = pl.col("retained_earnings") / pl.col("total_assets")
-    x3 = pl.col("operating_income") / pl.col("total_assets")
+    x3 = pl.col("operating_income_ttm") / pl.col("total_assets")
     x4 = pl.col("market_value_statement_unit") / pl.col("total_liabilities")
-    x5 = pl.col("revenue") / pl.col("total_assets")
+    x5 = pl.col("revenue_ttm") / pl.col("total_assets")
     has_altman_inputs = (
         pl.col("total_assets").is_not_null()
         & (pl.col("total_assets") > 0)
@@ -344,14 +361,14 @@ def with_altman_z(frame: pl.DataFrame, config: L1GateConfig) -> pl.DataFrame:
         & pl.col("current_assets").is_not_null()
         & pl.col("current_liabilities").is_not_null()
         & pl.col("retained_earnings").is_not_null()
-        & pl.col("operating_income").is_not_null()
+        & pl.col("operating_income_ttm").is_not_null()
         & pl.col("market_value_statement_unit").is_not_null()
     )
     manufacturing_score = (1.2 * x1) + (1.4 * x2) + (3.3 * x3) + (0.6 * x4) + x5
     nonmanufacturing_score = (6.56 * x1) + (3.26 * x2) + (6.72 * x3) + (1.05 * x4)
     return frame.with_columns(
         is_nonmanufacturing.alias("is_nonmanufacturing"),
-        pl.when(has_altman_inputs & (~is_nonmanufacturing) & pl.col("revenue").is_not_null())
+        pl.when(has_altman_inputs & (~is_nonmanufacturing) & pl.col("revenue_ttm").is_not_null())
         .then(manufacturing_score)
         .when(has_altman_inputs & is_nonmanufacturing)
         .then(nonmanufacturing_score)
@@ -382,28 +399,31 @@ def with_optional_l1_fields(frame: pl.DataFrame, config: L1GateConfig) -> pl.Dat
 
 
 def normalize_financial_long_frame(financials: pl.DataFrame) -> pl.DataFrame:
-    records: list[dict[str, object]] = []
-    for row in financials.iter_rows(named=True):
-        alias = FINANCIAL_TYPE_ALIASES.get(str(row["type"]))
-        if alias is None:
-            continue
-        data_date = row["data_date"]
-        publish_date = row["publish_date"]
-        if not isinstance(data_date, date) or not isinstance(publish_date, date):
-            raise UniverseGateError("financials data_date/publish_date must contain date values")
-        records.append(
-            {
-                "symbol": str(row["symbol"]),
-                "data_date": data_date,
-                "publish_date": publish_date,
-                "field": alias,
-                "value": float(row["value"]),
-            }
-        )
-    if not records:
+    type_names = list(FINANCIAL_TYPE_ALIASES)
+    field_names = list(FINANCIAL_TYPE_ALIASES.values())
+    filtered = financials.filter(pl.col("type").is_in(type_names))
+    if filtered.is_empty():
         return empty_normalized_financials()
-    return (
-        pl.DataFrame(records)
+    normalized_long = filtered.select(
+        pl.col("symbol").cast(pl.Utf8),
+        pl.col("data_date").cast(pl.Date, strict=True),
+        pl.col("publish_date").cast(pl.Date, strict=True),
+        pl.col("type")
+        .replace_strict(type_names, field_names, return_dtype=pl.Utf8)
+        .alias("field"),
+        pl.col("value").cast(pl.Float64, strict=True),
+    )
+    conflicts = (
+        normalized_long.group_by(["symbol", "data_date", "publish_date", "field"])
+        .agg(pl.col("value").n_unique().alias("value_count"))
+        .filter(pl.col("value_count") > 1)
+    )
+    if not conflicts.is_empty():
+        raise UniverseGateError(
+            "financials contain conflicting values for the same period and field"
+        )
+    wide = (
+        normalized_long
         .pivot(
             index=["symbol", "data_date", "publish_date"],
             on="field",
@@ -412,6 +432,12 @@ def normalize_financial_long_frame(financials: pl.DataFrame) -> pl.DataFrame:
         )
         .sort(["symbol", "data_date"])
     )
+    missing_fields = sorted(set(FINANCIAL_TYPE_ALIASES.values()) - set(wide.columns))
+    if missing_fields:
+        wide = wide.with_columns(
+            [pl.lit(None, dtype=pl.Float64).alias(field) for field in missing_fields]
+        )
+    return wide.select(empty_normalized_financials().columns)
 
 
 def empty_normalized_financials() -> pl.DataFrame:
@@ -433,22 +459,122 @@ def empty_normalized_financials() -> pl.DataFrame:
 
 
 def negative_ocf_quarters(financials: pl.DataFrame) -> pl.DataFrame:
-    if "operating_cash_flow" not in financials.columns:
+    if "operating_cash_flow" not in financials.columns or financials.is_empty():
         return pl.DataFrame(schema={"symbol": pl.Utf8, "negative_ocf_quarters": pl.Int64})
-    records: list[dict[str, object]] = []
-    for (symbol,), group in financials.sort(["symbol", "data_date"]).group_by("symbol"):
-        count = 0
-        rows = list(group.iter_rows(named=True))
-        for row in reversed(rows):
-            value = row.get("operating_cash_flow")
-            if value is None:
-                continue
-            if float(value) < 0:
-                count += 1
-                continue
-            break
-        records.append({"symbol": str(symbol), "negative_ocf_quarters": count})
-    return pl.DataFrame(records, schema={"symbol": pl.Utf8, "negative_ocf_quarters": pl.Int64})
+    cash_flow = (
+        financials.select("symbol", "data_date", "operating_cash_flow")
+        .filter(pl.col("operating_cash_flow").is_not_null())
+        .with_columns(
+            pl.col("data_date").dt.year().alias("fiscal_year"),
+            pl.col("data_date").dt.quarter().alias("fiscal_quarter"),
+        )
+        .sort(["symbol", "data_date"])
+        .with_columns(
+            pl.col("operating_cash_flow")
+            .shift(1)
+            .over(["symbol", "fiscal_year"])
+            .alias("previous_cumulative_ocf")
+        )
+        .with_columns(
+            pl.when(pl.col("fiscal_quarter") == 1)
+            .then(pl.col("operating_cash_flow"))
+            .otherwise(pl.col("operating_cash_flow") - pl.col("previous_cumulative_ocf"))
+            .alias("quarterly_ocf")
+        )
+    )
+    if cash_flow.is_empty():
+        return pl.DataFrame(schema={"symbol": pl.Utf8, "negative_ocf_quarters": pl.Int64})
+
+    latest = cash_flow.sort(["symbol", "data_date"]).group_by("symbol").tail(1)
+    latest_year = cash_flow.filter(
+        pl.col("fiscal_year") == pl.col("fiscal_year").max().over("symbol")
+    )
+    trailing_negative = (
+        latest_year.sort(["symbol", "data_date"], descending=[False, True])
+        .with_columns(
+            (~(pl.col("quarterly_ocf") < 0).fill_null(False))
+            .cast(pl.Int64)
+            .cum_sum()
+            .over("symbol")
+            .alias("break_count")
+        )
+        .filter(pl.col("break_count") == 0)
+        .group_by("symbol")
+        .len(name="negative_ocf_quarters")
+    )
+    return (
+        latest.select("symbol", "quarterly_ocf")
+        .join(trailing_negative, on="symbol", how="left")
+        .with_columns(
+            pl.when(pl.col("quarterly_ocf").is_not_null())
+            .then(pl.col("negative_ocf_quarters").fill_null(0))
+            .otherwise(None)
+            .cast(pl.Int64)
+            .alias("negative_ocf_quarters")
+        )
+        .select("symbol", "negative_ocf_quarters")
+    )
+
+
+def trailing_twelve_month_income(financials: pl.DataFrame) -> pl.DataFrame:
+    schema = {
+        "symbol": pl.Utf8,
+        "operating_income_ttm": pl.Float64,
+        "revenue_ttm": pl.Float64,
+    }
+    if financials.is_empty():
+        return pl.DataFrame(schema=schema)
+    latest_four = (
+        financials.select("symbol", "data_date", "operating_income", "revenue")
+        .filter(pl.col("operating_income").is_not_null() | pl.col("revenue").is_not_null())
+        .with_columns(
+            (
+                pl.col("data_date").dt.year() * 4
+                + pl.col("data_date").dt.quarter().cast(pl.Int32)
+            ).alias("quarter_index")
+        )
+        .sort(["symbol", "data_date"])
+        .group_by("symbol")
+        .tail(4)
+    )
+    if latest_four.is_empty():
+        return pl.DataFrame(schema=schema)
+    return (
+        latest_four.group_by("symbol")
+        .agg(
+            pl.len().alias("period_count"),
+            pl.col("quarter_index").min().alias("first_quarter"),
+            pl.col("quarter_index").max().alias("last_quarter"),
+            pl.col("operating_income").count().alias("operating_income_count"),
+            pl.col("operating_income").sum().alias("operating_income_sum"),
+            pl.col("revenue").count().alias("revenue_count"),
+            pl.col("revenue").sum().alias("revenue_sum"),
+        )
+        .with_columns(
+            (
+                (pl.col("period_count") == 4)
+                & ((pl.col("last_quarter") - pl.col("first_quarter")) == 3)
+            ).alias("has_four_consecutive_quarters")
+        )
+        .select(
+            "symbol",
+            pl.when(
+                pl.col("has_four_consecutive_quarters")
+                & (pl.col("operating_income_count") == 4)
+            )
+            .then(pl.col("operating_income_sum"))
+            .otherwise(None)
+            .cast(pl.Float64)
+            .alias("operating_income_ttm"),
+            pl.when(
+                pl.col("has_four_consecutive_quarters") & (pl.col("revenue_count") == 4)
+            )
+            .then(pl.col("revenue_sum"))
+            .otherwise(None)
+            .cast(pl.Float64)
+            .alias("revenue_ttm"),
+        )
+    )
 
 
 def apply_filter(
@@ -461,6 +587,12 @@ def apply_filter(
     filtered = frame.filter(predicate).sort("symbol")
     steps.append(GateStep(name=name, before=before, after=filtered.height))
     return filtered
+
+
+def append_skipped_step(frame: pl.DataFrame, name: str, steps: list[GateStep]) -> None:
+    steps.append(
+        GateStep(name=name, before=frame.height, after=frame.height, skipped_reason="no data")
+    )
 
 
 def listing_trading_days(row: dict[str, Any], calendar: TradingCalendar, as_of: date) -> int:
@@ -479,7 +611,7 @@ def is_nonmanufacturing_industry(market: str, industry: str) -> bool:
     return any(marker in industry for marker in NONMANUFACTURING_TEXT_MARKERS)
 
 
-def has_non_null_values(frame: pl.DataFrame, column: str) -> bool:
+def column_has_data(frame: pl.DataFrame, column: str) -> bool:
     return column in frame.columns and frame.select(pl.col(column).is_not_null().any()).item()
 
 

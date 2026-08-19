@@ -372,7 +372,17 @@ class FinMindProvider:
 
     def get_financials(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         validate_symbols(symbols)
-        key = cache_key("get_financials", symbols, start, end)
+        frames = [self._get_financials_for_symbol(symbol, start, end) for symbol in symbols]
+        combined = pl.concat(frames).sort(["symbol", "data_date", "statement", "type"])
+        return as_of_filter(combined, end)
+
+    def _get_financials_for_symbol(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        key = cache_key("get_financials", [symbol], start, end)
 
         def fetch() -> pl.DataFrame:
             rows: list[dict[str, Any]] = []
@@ -381,7 +391,7 @@ class FinMindProvider:
                 ("TaiwanStockBalanceSheet", "balance"),
                 ("TaiwanStockCashFlowsStatement", "cash_flow"),
             ]:
-                for row in self._fetch_dataset_for_symbols(dataset, symbols, start, end):
+                for row in self._fetch_dataset_for_symbols(dataset, [symbol], start, end):
                     enriched = dict(row)
                     enriched["statement"] = statement
                     rows.append(enriched)
@@ -396,7 +406,7 @@ class FinMindProvider:
                 .alias("publish_date")
             ).select("symbol", "data_date", "publish_date", "statement", "type", "value")
 
-        return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+        return self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache)
 
     def _get_price_frame(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         rows = self._fetch_dataset_for_symbols("TaiwanStockPrice", symbols, start, end)

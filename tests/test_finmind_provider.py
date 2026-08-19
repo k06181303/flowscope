@@ -494,6 +494,33 @@ def test_financials_include_statement_and_derived_publish_date(tmp_path: Path) -
     assert set(df["publish_date"].to_list()) == {date(2024, 5, 15)}
 
 
+def test_financials_cache_each_symbol_and_reuse_cache_across_list_order(
+    tmp_path: Path,
+) -> None:
+    class SymbolFinancialClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            rows = super().fetch_rows(request)
+            if request.dataset in {
+                "TaiwanStockFinancialStatements",
+                "TaiwanStockCashFlowsStatement",
+            }:
+                return [{**row, "stock_id": request.data_id} for row in rows]
+            return rows
+
+    client = SymbolFinancialClient()
+    provider = FinMindProvider(data_root=tmp_path, client=client)  # type: ignore[arg-type]
+
+    first = provider.get_financials(["2330", "2317"], date(2024, 1, 1), date(2024, 6, 30))
+    first_call_count = len(client.calls)
+    second = provider.get_financials(["2317", "2330"], date(2024, 1, 1), date(2024, 6, 30))
+
+    assert first["symbol"].unique().sort().to_list() == ["2317", "2330"]
+    assert second["symbol"].unique().sort().to_list() == ["2317", "2330"]
+    assert first_call_count == 6
+    assert len(client.calls) == first_call_count
+    assert len(list((tmp_path / "raw" / "finmind" / "get_financials").glob("*.parquet"))) == 2
+
+
 def test_shares_outstanding_cross_check_mismatch_warns_and_uses_market_value(
     tmp_path: Path,
 ) -> None:

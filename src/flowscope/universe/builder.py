@@ -107,6 +107,11 @@ def render_funnel(funnel: UniverseFunnel) -> str:
         render_count_line("資料完整度 >= 門檻", l1_after, funnel.completeness_count),
         f"  {'評分後 Top N':<18} {'':>10}  -> {funnel.final_count:>6,}",
     ]
+    lines.extend(
+        f"  {step.name:<30} skipped ({step.skipped_reason})"
+        for step in (*funnel.l0.steps, *funnel.l1.steps)
+        if step.skipped_reason is not None
+    )
     return "\n".join(lines)
 
 
@@ -140,4 +145,11 @@ def empty_financials() -> pl.DataFrame:
 
 
 def summarize_gate_steps(steps: tuple[GateStep, ...]) -> list[str]:
-    return [f"{step.name}: {step.before}->{step.after}" for step in steps]
+    return [
+        (
+            f"{step.name}: skipped ({step.skipped_reason})"
+            if step.skipped_reason is not None
+            else f"{step.name}: {step.before}->{step.after}"
+        )
+        for step in steps
+    ]

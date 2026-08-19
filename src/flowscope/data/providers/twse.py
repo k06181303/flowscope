@@ -73,8 +73,14 @@ class OfficialOpenApiClient:
 
 
 class OfficialMarketProvider:
-    def __init__(self, client: OfficialOpenApiClient | None = None) -> None:
+    def __init__(
+        self,
+        client: OfficialOpenApiClient | None = None,
+        *,
+        today: date | None = None,
+    ) -> None:
         self._client = client or OfficialOpenApiClient()
+        self._today = today or date.today()
 
     def get_listings(self, as_of: date) -> pl.DataFrame:
         rows: list[dict[str, object]] = []
@@ -88,6 +94,11 @@ class OfficialMarketProvider:
         return pl.DataFrame(rows).unique(subset=["symbol"], keep="first").sort("symbol")
 
     def get_warnings(self, as_of: date) -> pl.DataFrame:
+        if as_of < self._today:
+            raise OfficialMarketDataError(
+                "Official altered-trading endpoints are undated current snapshots; "
+                f"historical as_of={as_of.isoformat()} cannot be evaluated without PIT leakage"
+            )
         rows: list[dict[str, object]] = []
         raw_source_count = 0
         for endpoint in WARNING_ENDPOINTS:
@@ -171,9 +182,14 @@ def warning_symbol(endpoint: OfficialEndpoint, row: dict[str, Any]) -> str | Non
 
 
 def warning_date(endpoint: OfficialEndpoint, row: dict[str, Any], as_of: date) -> date:
-    if endpoint.source == "twse_altered_trading":
+    if endpoint.source in {"twse_altered_trading", "tpex_altered_trading"}:
         return as_of
-    return parse_roc_compact(str(row.get("Date", ""))) or as_of
+    parsed = parse_roc_compact(str(row.get("Date", "")))
+    if parsed is None:
+        raise OfficialMarketDataError(
+            f"{endpoint.source} warning row has no valid source date"
+        )
+    return parsed
 
 
 def warning_type_for(endpoint: OfficialEndpoint, row: dict[str, Any]) -> str | None:
