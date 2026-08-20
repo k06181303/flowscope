@@ -8,7 +8,13 @@ import polars as pl
 
 from flowscope.config.schema import FlowScopeConfig
 from flowscope.data.calendar import TradingCalendar
-from flowscope.universe.gates import GateApplication, GateStep, apply_l0_gates, apply_l1_gates
+from flowscope.universe.gates import (
+    GateApplication,
+    GateStep,
+    UniverseGateError,
+    apply_l0_gates,
+    apply_l1_gates,
+)
 
 LISTING_DAY_LOOKBACK_CALENDAR_DAYS = 500
 FINANCIAL_LOOKBACK_CALENDAR_DAYS = 730
@@ -33,6 +39,8 @@ class MarketMetaProvider(Protocol):
 @dataclass(frozen=True)
 class UniverseFunnel:
     as_of: date
+    price_as_of: date
+    warnings_snapshot: date
     market: str
     initial_count: int
     l0: GateApplication
@@ -57,20 +65,31 @@ def build_universe_funnel(
     as_of: date,
     data_provider: PriceDataProvider,
     market_provider: MarketMetaProvider,
+    *,
+    price_as_of: date | None = None,
+    warnings_snapshot: date | None = None,
 ) -> UniverseFunnel:
+    requested_price_as_of = price_as_of or as_of
+    resolved_warnings_snapshot = warnings_snapshot or as_of
+    if requested_price_as_of > as_of:
+        raise UniverseGateError(
+            "price_as_of must be on or before as_of: "
+            f"price_as_of={requested_price_as_of.isoformat()}, as_of={as_of.isoformat()}"
+        )
+
     listings = market_provider.get_listings(as_of)
-    calendar_start = as_of - timedelta(days=LISTING_DAY_LOOKBACK_CALENDAR_DAYS)
-    calendar = data_provider.get_trading_calendar(calendar_start, as_of)
-    latest_trade_date = calendar.on_or_before(as_of)
+    calendar_start = requested_price_as_of - timedelta(days=LISTING_DAY_LOOKBACK_CALENDAR_DAYS)
+    calendar = data_provider.get_trading_calendar(calendar_start, requested_price_as_of)
+    latest_trade_date = calendar.on_or_before(requested_price_as_of)
     trailing_dates = calendar.trailing_dates(latest_trade_date, 20)
     price_start = trailing_dates[0]
 
     symbols = [str(symbol) for symbol in listings["symbol"]]
     prices = data_provider.get_price_history(symbols, price_start, latest_trade_date)
-    l0 = apply_l0_gates(listings, prices, calendar, as_of, config.gates.l0)
+    l0 = apply_l0_gates(listings, prices, calendar, latest_trade_date, config.gates.l0)
 
     l0_symbols = [str(symbol) for symbol in l0.frame["symbol"]]
-    warnings = market_provider.get_warnings(as_of)
+    warnings = market_provider.get_warnings(resolved_warnings_snapshot)
     market_values = (
         data_provider.get_market_values(l0_symbols, latest_trade_date, latest_trade_date)
         if l0_symbols
@@ -88,6 +107,8 @@ def build_universe_funnel(
     l1 = apply_l1_gates(l0.frame, warnings, financials, market_values, config.gates.l1)
     return UniverseFunnel(
         as_of=as_of,
+        price_as_of=latest_trade_date,
+        warnings_snapshot=resolved_warnings_snapshot,
         market=config.market,
         initial_count=listings.height,
         l0=l0,
@@ -100,7 +121,11 @@ def render_funnel(funnel: UniverseFunnel) -> str:
     l0_after = funnel.l0.frame.height
     l1_after = funnel.l1.frame.height
     lines = [
-        f"Universe funnel (as_of={funnel.as_of.isoformat()}, market={funnel.market})",
+        "Universe funnel "
+        f"(as_of={funnel.as_of.isoformat()}, "
+        f"price_as_of={funnel.price_as_of.isoformat()}, "
+        f"warnings_snapshot={funnel.warnings_snapshot.isoformat()}, "
+        f"market={funnel.market})",
         f"  {'全市場上市櫃':<18} {funnel.initial_count:>6,}",
         render_count_line("L0 流動性", funnel.initial_count, l0_after),
         render_count_line("L1 排雷", l0_after, l1_after),

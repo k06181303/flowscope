@@ -486,11 +486,8 @@ def negative_ocf_quarters(financials: pl.DataFrame) -> pl.DataFrame:
         return pl.DataFrame(schema={"symbol": pl.Utf8, "negative_ocf_quarters": pl.Int64})
 
     latest = cash_flow.sort(["symbol", "data_date"]).group_by("symbol").tail(1)
-    latest_year = cash_flow.filter(
-        pl.col("fiscal_year") == pl.col("fiscal_year").max().over("symbol")
-    )
     trailing_negative = (
-        latest_year.sort(["symbol", "data_date"], descending=[False, True])
+        cash_flow.sort(["symbol", "data_date"], descending=[False, True])
         .with_columns(
             (~(pl.col("quarterly_ocf") < 0).fill_null(False))
             .cast(pl.Int64)

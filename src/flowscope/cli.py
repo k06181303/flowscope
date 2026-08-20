@@ -43,6 +43,12 @@ def _parse_date(value: str | None, option_name: str) -> date | None:
         raise typer.BadParameter(f"{option_name} must be YYYY-MM-DD") from None
 
 
+def _parse_snapshot_date(value: str | None, option_name: str) -> date | None:
+    if value == "today":
+        return date.today()
+    return _parse_date(value, option_name)
+
+
 @app.command()
 def run(
     config: Annotated[
@@ -175,7 +181,21 @@ def funnel(
     ] = Path("configs/tw_swing.yaml"),
     as_of: Annotated[
         str | None,
-        typer.Option("--as-of", help="Point-in-time execution date."),
+        typer.Option("--as-of", help="Point-in-time data cutoff date."),
+    ] = None,
+    price_as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--price-as-of",
+            help="Price cutoff; set to the latest completed trading date before market close.",
+        ),
+    ] = None,
+    warnings_snapshot: Annotated[
+        str | None,
+        typer.Option(
+            "--warnings-snapshot",
+            help="Official warning snapshot date (YYYY-MM-DD or 'today').",
+        ),
     ] = None,
     no_cache: Annotated[
         bool,
@@ -184,12 +204,18 @@ def funnel(
 ) -> None:
     loaded = load_config_with_hash(config)
     parsed_as_of = _parse_date(as_of, "--as-of") or date.today()
+    parsed_price_as_of = _parse_date(price_as_of, "--price-as-of") or parsed_as_of
+    parsed_warnings_snapshot = (
+        _parse_snapshot_date(warnings_snapshot, "--warnings-snapshot") or parsed_as_of
+    )
     try:
         report = build_universe_funnel(
             loaded.config,
             parsed_as_of,
             FinMindProvider(no_cache=no_cache),
             OfficialMarketProvider(),
+            price_as_of=parsed_price_as_of,
+            warnings_snapshot=parsed_warnings_snapshot,
         )
     except (FinMindError, OfficialMarketDataError, UniverseGateError) as exc:
         typer.secho(f"Error: {exc}", err=True)

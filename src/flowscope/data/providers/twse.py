@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import ssl
 import urllib.error
@@ -62,6 +63,19 @@ class OfficialOpenApiClient:
                 raise OfficialMarketDataError(
                     f"Official OpenAPI request failed after SSL fallback: {url}"
                 ) from retry_exc
+        except http.client.IncompleteRead:
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8-sig"))
+            except (
+                http.client.IncompleteRead,
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                json.JSONDecodeError,
+            ) as retry_exc:
+                raise OfficialMarketDataError(
+                    f"Official OpenAPI response remained incomplete after retry: {url}"
+                ) from retry_exc
         except json.JSONDecodeError as exc:
             raise OfficialMarketDataError(f"Official OpenAPI returned invalid JSON: {url}") from exc
 
@@ -94,10 +108,12 @@ class OfficialMarketProvider:
         return pl.DataFrame(rows).unique(subset=["symbol"], keep="first").sort("symbol")
 
     def get_warnings(self, as_of: date) -> pl.DataFrame:
-        if as_of < self._today:
+        if as_of != self._today:
+            snapshot_direction = "historical" if as_of < self._today else "future"
             raise OfficialMarketDataError(
                 "Official altered-trading endpoints are undated current snapshots; "
-                f"historical as_of={as_of.isoformat()} cannot be evaluated without PIT leakage"
+                f"{snapshot_direction} as_of={as_of.isoformat()} cannot be evaluated "
+                "without misdating the snapshot"
             )
         rows: list[dict[str, object]] = []
         raw_source_count = 0

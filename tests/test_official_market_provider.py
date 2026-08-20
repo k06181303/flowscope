@@ -1,11 +1,34 @@
 from __future__ import annotations
 
+import http.client
+import json
 from datetime import date
 from typing import Any
 
 import pytest
 
-from flowscope.data.providers.twse import OfficialMarketDataError, OfficialMarketProvider
+from flowscope.data.providers.twse import (
+    OfficialMarketDataError,
+    OfficialMarketProvider,
+    OfficialOpenApiClient,
+)
+
+
+class Response:
+    def __init__(self, payload: list[dict[str, object]], *, incomplete: bool = False) -> None:
+        self._payload = payload
+        self._incomplete = incomplete
+
+    def __enter__(self) -> Response:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        if self._incomplete:
+            raise http.client.IncompleteRead(b"partial", 10)
+        return json.dumps(self._payload).encode("utf-8")
 
 
 class StaticOfficialClient:
@@ -62,6 +85,23 @@ class StaticOfficialClient:
         raise AssertionError(f"unexpected url {url}")
 
 
+def test_official_client_retries_incomplete_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = [
+        Response([], incomplete=True),
+        Response([{"Code": "2330"}]),
+    ]
+
+    def urlopen(request: object, timeout: int) -> Response:
+        assert request is not None
+        assert timeout == 30
+        return responses.pop(0)
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    assert OfficialOpenApiClient().fetch_rows("https://example.test") == [{"Code": "2330"}]
+    assert responses == []
+
+
 def test_official_provider_rebuilds_current_listing_snapshot() -> None:
     provider = OfficialMarketProvider(client=StaticOfficialClient())  # type: ignore[arg-type]
 
@@ -97,6 +137,16 @@ def test_official_provider_rejects_historical_warning_snapshot() -> None:
 
     with pytest.raises(OfficialMarketDataError, match="historical as_of=2025-08-19"):
         provider.get_warnings(date(2025, 8, 19))
+
+
+def test_official_provider_rejects_future_warning_snapshot() -> None:
+    provider = OfficialMarketProvider(  # type: ignore[arg-type]
+        client=StaticOfficialClient(),
+        today=date(2026, 8, 20),
+    )
+
+    with pytest.raises(OfficialMarketDataError, match="future as_of=2026-08-21"):
+        provider.get_warnings(date(2026, 8, 21))
 
 
 def test_official_provider_rejects_dated_warning_row_without_source_date() -> None:

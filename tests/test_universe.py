@@ -13,6 +13,7 @@ from flowscope.universe.builder import UniverseFunnel, build_universe_funnel, re
 from flowscope.universe.gates import (
     GateApplication,
     GateStep,
+    UniverseGateError,
     apply_l0_gates,
     apply_l1_gates,
     is_nonmanufacturing_industry,
@@ -166,18 +167,47 @@ def test_l1_negative_ocf_detects_latest_positive_quarter_from_negative_cumulativ
     assert row["negative_ocf_quarters"] == 0
 
 
-def test_l1_negative_ocf_streak_does_not_cross_fiscal_year() -> None:
+def test_l1_negative_ocf_streak_crosses_fiscal_year_after_yearly_differencing() -> None:
     financials = pl.DataFrame(
         financial_records(
             "YEAR_BOUNDARY",
-            periods=(date(2024, 12, 31), date(2025, 3, 31)),
-            operating_cash_flows=(-100.0, -50.0),
+            periods=(
+                date(2024, 3, 31),
+                date(2024, 6, 30),
+                date(2024, 9, 30),
+                date(2024, 12, 31),
+                date(2025, 3, 31),
+                date(2025, 6, 30),
+            ),
+            operating_cash_flows=(-10.0, -20.0, -30.0, -40.0, -5.0, -15.0),
         )
     )
 
     row = latest_financials(financials).row(0, named=True)
 
-    assert row["negative_ocf_quarters"] == 1
+    # 獨立手算:2024 單季均 -10；2025Q1=-5、Q2=-15-(-5)=-10，共連續 6 季。
+    assert row["negative_ocf_quarters"] == 6
+
+
+def test_l1_negative_ocf_q1_keeps_previous_year_streak() -> None:
+    financials = pl.DataFrame(
+        financial_records(
+            "Q1_AS_OF",
+            periods=(
+                date(2024, 3, 31),
+                date(2024, 6, 30),
+                date(2024, 9, 30),
+                date(2024, 12, 31),
+                date(2025, 3, 31),
+            ),
+            operating_cash_flows=(-10.0, -20.0, -30.0, -40.0, -5.0),
+        )
+    )
+
+    row = latest_financials(financials).row(0, named=True)
+
+    # 獨立手算:前一年四個單季均 -10，2025Q1=-5；Q1 as_of 應保留跨年連續 5 季。
+    assert row["negative_ocf_quarters"] == 5
 
 
 def test_l1_altman_uses_four_quarter_ttm_and_rejects_short_history() -> None:
@@ -238,6 +268,8 @@ def test_l1_gates_disclose_skipped_when_optional_source_has_no_data() -> None:
 def test_render_funnel_matches_spec_shape() -> None:
     funnel = UniverseFunnel(
         as_of=date(2024, 8, 18),
+        price_as_of=date(2024, 8, 16),
+        warnings_snapshot=date(2024, 8, 18),
         market="TW",
         initial_count=1812,
         l0=GateApplication(pl.DataFrame({"symbol": ["A"] * 672}), (GateStep("L0", 1812, 672),)),
@@ -246,7 +278,8 @@ def test_render_funnel_matches_spec_shape() -> None:
     )
 
     assert render_funnel(funnel).splitlines() == [
-        "Universe funnel (as_of=2024-08-18, market=TW)",
+        "Universe funnel (as_of=2024-08-18, price_as_of=2024-08-16, "
+        "warnings_snapshot=2024-08-18, market=TW)",
         "  全市場上市櫃              1,812",
         "  L0 流動性             △  1,140  ->    672",
         "  L1 排雷              △     83  ->    589",
@@ -258,6 +291,8 @@ def test_render_funnel_matches_spec_shape() -> None:
 def test_render_funnel_discloses_gate_skipped_for_no_data() -> None:
     funnel = UniverseFunnel(
         as_of=date(2024, 8, 18),
+        price_as_of=date(2024, 8, 16),
+        warnings_snapshot=date(2024, 8, 18),
         market="TW",
         initial_count=1,
         l0=GateApplication(pl.DataFrame({"symbol": ["A"]}), ()),
@@ -276,17 +311,51 @@ def test_render_funnel_discloses_gate_skipped_for_no_data() -> None:
 def test_builder_fetches_exact_trailing_20_trading_days_for_l0() -> None:
     config = load_config(Path("configs/tw_swing.yaml"))
     as_of = date(2025, 5, 15)
+    price_as_of = date(2025, 5, 14)
+    warnings_snapshot = date(2025, 5, 16)
     calendar = TradingCalendar(
         tuple(date(2024, 1, 1) + timedelta(days=index) for index in range(501))
     )
     data_provider = StaticPriceProvider(calendar)
 
-    funnel = build_universe_funnel(config, as_of, data_provider, StaticMarketProvider())
+    market_provider = StaticMarketProvider()
+    funnel = build_universe_funnel(
+        config,
+        as_of,
+        data_provider,
+        market_provider,
+        price_as_of=price_as_of,
+        warnings_snapshot=warnings_snapshot,
+    )
 
-    assert data_provider.price_request == (calendar.trailing_dates(as_of, 20)[0], as_of)
+    assert data_provider.price_request == (
+        calendar.trailing_dates(price_as_of, 20)[0],
+        price_as_of,
+    )
+    assert data_provider.financial_request is not None
+    assert data_provider.financial_request[1] == as_of
+    assert market_provider.warning_request == warnings_snapshot
+    assert funnel.price_as_of == price_as_of
+    assert funnel.warnings_snapshot == warnings_snapshot
     assert funnel.initial_count == 1
     assert funnel.l0.frame.height == 1
     assert funnel.l1.frame.height == 1
+
+
+def test_builder_rejects_price_cutoff_after_data_cutoff() -> None:
+    config = load_config(Path("configs/tw_swing.yaml"))
+    calendar = TradingCalendar(
+        tuple(date(2024, 1, 1) + timedelta(days=index) for index in range(501))
+    )
+
+    with pytest.raises(UniverseGateError, match="price_as_of=2025-05-16"):
+        build_universe_funnel(
+            config,
+            date(2025, 5, 15),
+            StaticPriceProvider(calendar),
+            StaticMarketProvider(),
+            price_as_of=date(2025, 5, 16),
+        )
 
 
 def listing(
@@ -452,6 +521,7 @@ class StaticPriceProvider:
     def __init__(self, calendar: TradingCalendar) -> None:
         self._calendar = calendar
         self.price_request: tuple[date, date] | None = None
+        self.financial_request: tuple[date, date] | None = None
 
     def get_trading_calendar(self, start: date, end: date) -> TradingCalendar:
         return self._calendar
@@ -474,14 +544,19 @@ class StaticPriceProvider:
         )
 
     def get_financials(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
+        self.financial_request = (start, end)
         return financial_rows().filter(pl.col("symbol").is_in(symbols))
 
 
 class StaticMarketProvider:
+    def __init__(self) -> None:
+        self.warning_request: date | None = None
+
     def get_listings(self, as_of: date) -> pl.DataFrame:
         return pl.DataFrame(
             [listing("MFG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24")]
         )
 
     def get_warnings(self, as_of: date) -> pl.DataFrame:
+        self.warning_request = as_of
         return empty_warnings()
