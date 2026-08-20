@@ -13,6 +13,7 @@ from flowscope.data.providers.finmind import (
     FinMindRequest,
     align_holder_distribution_to_trading_days,
     balance_shares_as_of,
+    financial_cache_window,
     financial_publish_date,
     latest_balance_lookup,
     month_end,
@@ -510,15 +511,30 @@ def test_financials_cache_each_symbol_and_reuse_cache_across_list_order(
     client = SymbolFinancialClient()
     provider = FinMindProvider(data_root=tmp_path, client=client)  # type: ignore[arg-type]
 
-    first = provider.get_financials(["2330", "2317"], date(2024, 1, 1), date(2024, 6, 30))
+    first = provider.get_financials(["2330", "2317"], date(2024, 1, 1), date(2024, 8, 20))
     first_call_count = len(client.calls)
-    second = provider.get_financials(["2317", "2330"], date(2024, 1, 1), date(2024, 6, 30))
+    second = provider.get_financials(["2317", "2330"], date(2024, 1, 2), date(2024, 8, 19))
 
     assert first["symbol"].unique().sort().to_list() == ["2317", "2330"]
     assert second["symbol"].unique().sort().to_list() == ["2317", "2330"]
     assert first_call_count == 6
     assert len(client.calls) == first_call_count
     assert len(list((tmp_path / "raw" / "finmind" / "get_financials").glob("*.parquet"))) == 2
+
+
+def test_financial_cache_window_aligns_adjacent_as_of_dates_to_quarters() -> None:
+    assert financial_cache_window(date(2024, 8, 20), date(2026, 8, 20)) == (
+        date(2024, 7, 1),
+        date(2026, 6, 30),
+    )
+    assert financial_cache_window(date(2024, 8, 19), date(2026, 8, 19)) == (
+        date(2024, 7, 1),
+        date(2026, 6, 30),
+    )
+    assert financial_cache_window(date(2024, 1, 1), date(2024, 6, 30)) == (
+        date(2024, 1, 1),
+        date(2024, 6, 30),
+    )
 
 
 def test_shares_outstanding_cross_check_mismatch_warns_and_uses_market_value(

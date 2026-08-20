@@ -1,4 +1,5 @@
-from datetime import date
+import os
+from datetime import date, datetime
 
 import polars as pl
 
@@ -32,3 +33,53 @@ def test_no_cache_forces_fetch(tmp_path) -> None:  # type: ignore[no-untyped-def
     assert first["value"].to_list() == [1]
     assert second["value"].to_list() == [1]
     assert third["value"].to_list() == [2]
+
+
+def test_financial_cache_refreshes_until_publish_deadline_then_becomes_immutable(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    cache = ParquetCache(tmp_path)
+    key = CacheKey(
+        provider="finmind",
+        method="get_financials",
+        symbol_hash="abc",
+        start=date(2024, 1, 1),
+        end=date(2024, 6, 30),
+    )
+    calls = 0
+
+    def fetch() -> pl.DataFrame:
+        nonlocal calls
+        calls += 1
+        return pl.DataFrame({"value": [calls]})
+
+    cache.get_or_fetch(
+        key,
+        fetch,
+        no_cache=False,
+        today=date(2024, 8, 1),
+        immutable_after=date(2024, 8, 14),
+    )
+    path = cache.path_for(key)
+    old_timestamp = datetime(2024, 8, 1).timestamp()
+    os.utime(path, (old_timestamp, old_timestamp))
+
+    refreshed = cache.get_or_fetch(
+        key,
+        fetch,
+        no_cache=False,
+        today=date(2024, 8, 2),
+        immutable_after=date(2024, 8, 14),
+    )
+    os.utime(path, (old_timestamp, old_timestamp))
+    immutable = cache.get_or_fetch(
+        key,
+        fetch,
+        no_cache=False,
+        today=date(2024, 8, 15),
+        immutable_after=date(2024, 8, 14),
+    )
+
+    assert refreshed["value"].to_list() == [2]
+    assert immutable["value"].to_list() == [2]
+    assert calls == 2

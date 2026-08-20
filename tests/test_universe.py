@@ -312,7 +312,7 @@ def test_builder_fetches_exact_trailing_20_trading_days_for_l0() -> None:
     config = load_config(Path("configs/tw_swing.yaml"))
     as_of = date(2025, 5, 15)
     price_as_of = date(2025, 5, 14)
-    warnings_snapshot = date(2025, 5, 16)
+    warnings_snapshot = date(2025, 5, 15)
     calendar = TradingCalendar(
         tuple(date(2024, 1, 1) + timedelta(days=index) for index in range(501))
     )
@@ -335,6 +335,7 @@ def test_builder_fetches_exact_trailing_20_trading_days_for_l0() -> None:
     assert data_provider.financial_request is not None
     assert data_provider.financial_request[1] == as_of
     assert market_provider.warning_request == warnings_snapshot
+    assert market_provider.listing_request == price_as_of
     assert funnel.price_as_of == price_as_of
     assert funnel.warnings_snapshot == warnings_snapshot
     assert funnel.initial_count == 1
@@ -355,6 +356,22 @@ def test_builder_rejects_price_cutoff_after_data_cutoff() -> None:
             StaticPriceProvider(calendar),
             StaticMarketProvider(),
             price_as_of=date(2025, 5, 16),
+        )
+
+
+def test_builder_rejects_warning_snapshot_after_data_cutoff() -> None:
+    config = load_config(Path("configs/tw_swing.yaml"))
+    calendar = TradingCalendar(
+        tuple(date(2024, 1, 1) + timedelta(days=index) for index in range(501))
+    )
+
+    with pytest.raises(UniverseGateError, match="warnings_snapshot=2025-05-16"):
+        build_universe_funnel(
+            config,
+            date(2025, 5, 15),
+            StaticPriceProvider(calendar),
+            StaticMarketProvider(),
+            warnings_snapshot=date(2025, 5, 16),
         )
 
 
@@ -550,9 +567,11 @@ class StaticPriceProvider:
 
 class StaticMarketProvider:
     def __init__(self) -> None:
+        self.listing_request: date | None = None
         self.warning_request: date | None = None
 
     def get_listings(self, as_of: date) -> pl.DataFrame:
+        self.listing_request = as_of
         return pl.DataFrame(
             [listing("MFG", "TWSE", "COMMON_STOCK", date(2024, 1, 1), industry="24")]
         )

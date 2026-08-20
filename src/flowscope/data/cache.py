@@ -51,9 +51,15 @@ class ParquetCache:
         *,
         no_cache: bool,
         today: date | None = None,
+        immutable_after: date | None = None,
     ) -> pl.DataFrame:
         path = self.path_for(key)
-        if not no_cache and path.is_file() and self._is_valid(path, key.end, today):
+        if not no_cache and path.is_file() and self._is_valid(
+            path,
+            key.end,
+            today,
+            immutable_after,
+        ):
             return pl.read_parquet(path)
 
         df = fetch()
@@ -63,8 +69,19 @@ class ParquetCache:
         df.write_parquet(path)
         return df
 
-    def _is_valid(self, path: Path, end: date, today: date | None) -> bool:
+    def _is_valid(
+        self,
+        path: Path,
+        end: date,
+        today: date | None,
+        immutable_after: date | None,
+    ) -> bool:
         effective_today = today or datetime.now().date()
+        if immutable_after is not None:
+            if effective_today > immutable_after:
+                return True
+            modified_date = datetime.fromtimestamp(path.stat().st_mtime).date()
+            return modified_date >= effective_today
         if end < effective_today - timedelta(days=30):
             return True
         modified_date = datetime.fromtimestamp(path.stat().st_mtime).date()

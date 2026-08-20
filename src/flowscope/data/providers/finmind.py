@@ -373,7 +373,11 @@ class FinMindProvider:
     def get_financials(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         validate_symbols(symbols)
         frames = [self._get_financials_for_symbol(symbol, start, end) for symbol in symbols]
-        combined = pl.concat(frames).sort(["symbol", "data_date", "statement", "type"])
+        combined = (
+            pl.concat(frames)
+            .filter(pl.col("data_date").is_between(start, end, closed="both"))
+            .sort(["symbol", "data_date", "statement", "type"])
+        )
         return as_of_filter(combined, end)
 
     def _get_financials_for_symbol(
@@ -382,7 +386,8 @@ class FinMindProvider:
         start: date,
         end: date,
     ) -> pl.DataFrame:
-        key = cache_key("get_financials", [symbol], start, end)
+        cache_start, cache_end = financial_cache_window(start, end)
+        key = cache_key("get_financials", [symbol], cache_start, cache_end)
 
         def fetch() -> pl.DataFrame:
             rows: list[dict[str, Any]] = []
@@ -391,7 +396,12 @@ class FinMindProvider:
                 ("TaiwanStockBalanceSheet", "balance"),
                 ("TaiwanStockCashFlowsStatement", "cash_flow"),
             ]:
-                for row in self._fetch_dataset_for_symbols(dataset, [symbol], start, end):
+                for row in self._fetch_dataset_for_symbols(
+                    dataset,
+                    [symbol],
+                    cache_start,
+                    cache_end,
+                ):
                     enriched = dict(row)
                     enriched["statement"] = statement
                     rows.append(enriched)
@@ -406,7 +416,12 @@ class FinMindProvider:
                 .alias("publish_date")
             ).select("symbol", "data_date", "publish_date", "statement", "type", "value")
 
-        return self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache)
+        return self._cache.get_or_fetch(
+            key,
+            fetch,
+            no_cache=self._no_cache,
+            immutable_after=financial_publish_date(cache_end),
+        )
 
     def _get_price_frame(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         rows = self._fetch_dataset_for_symbols("TaiwanStockPrice", symbols, start, end)
@@ -935,6 +950,26 @@ def _empty_holder_daily_frame(holder_distribution: pl.DataFrame) -> pl.DataFrame
 def financial_publish_date(period_end: date) -> date:
     delay_days = 75 if period_end.month == 12 else 45
     return period_end + timedelta(days=delay_days)
+
+
+def financial_cache_window(start: date, end: date) -> tuple[date, date]:
+    start_quarter_month = ((start.month - 1) // 3) * 3 + 1
+    cache_start = date(start.year, start_quarter_month, 1)
+    end_quarter_month = ((end.month - 1) // 3) * 3 + 1
+    current_quarter_start = date(end.year, end_quarter_month, 1)
+    if end_quarter_month == 10:
+        next_quarter_start = date(end.year + 1, 1, 1)
+    else:
+        next_quarter_start = date(end.year, end_quarter_month + 3, 1)
+    current_quarter_end = next_quarter_start - timedelta(days=1)
+    cache_end = (
+        current_quarter_end
+        if end == current_quarter_end
+        else current_quarter_start - timedelta(days=1)
+    )
+    if cache_end < cache_start:
+        raise ValueError("financial query must include at least one completed quarter")
+    return cache_start, cache_end
 
 
 def next_month_tenth(data_date: date) -> date:

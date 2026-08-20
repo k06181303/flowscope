@@ -76,11 +76,17 @@ def build_universe_funnel(
             "price_as_of must be on or before as_of: "
             f"price_as_of={requested_price_as_of.isoformat()}, as_of={as_of.isoformat()}"
         )
+    if resolved_warnings_snapshot > as_of:
+        raise UniverseGateError(
+            "warnings_snapshot must be on or before as_of: "
+            f"warnings_snapshot={resolved_warnings_snapshot.isoformat()}, "
+            f"as_of={as_of.isoformat()}"
+        )
 
-    listings = market_provider.get_listings(as_of)
     calendar_start = requested_price_as_of - timedelta(days=LISTING_DAY_LOOKBACK_CALENDAR_DAYS)
     calendar = data_provider.get_trading_calendar(calendar_start, requested_price_as_of)
     latest_trade_date = calendar.on_or_before(requested_price_as_of)
+    listings = market_provider.get_listings(latest_trade_date)
     trailing_dates = calendar.trailing_dates(latest_trade_date, 20)
     price_start = trailing_dates[0]
 

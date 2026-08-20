@@ -6,9 +6,9 @@
 
 ## 目前狀態
 
-**Step 4 二次補修完成,待審查。**
+**Step 4 已通過審查；進入 Step 5 前處理非阻擋建議。**
 
-下一步:審查通過後進入 SPEC §13 **Step 5 — 技術面因子 T01–T21**
+下一步:完成財報快取/PIT 日期前置修正後進入 SPEC §13 **Step 5 — 技術面因子 T01–T21**
 
 DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `flowscope diagnose funnel --as-of 2026-08-20 --price-as-of 2026-08-19 --warnings-snapshot today` 可明示資料截止日、最近已完成交易日與 current warning snapshot。2026-08-20 實跑全市場:1,985 → L0 749 → L1 525。L1 逐關為 warnings 749→720、TTM Altman 720→639、跨會計年度 negative OCF streak 639→525；capital raise 明示 `skipped (no data)`。
 
@@ -21,7 +21,7 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 1 | 專案骨架、config schema、CLI 空殼 | 2026-08-18 | 是 | `step-1: initialize project skeleton` |
 | 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer`;`step-2: fix FinMind batching safeguards` |
 | 3 | 集保 provider (FinMind) + 解析 + PIT 對齊 | 2026-08-19 | 是 | `step-3: implement FinMind holder distribution`;`step-3: tighten holder data safeguards` |
-| 4 | Universe + L0/L1 Gate + 漏斗輸出 | 2026-08-20 | 是 | `step-4: implement universe gates and funnel`;`step-4: fix financial gates and industry split`;`step-4: correct quarterly financial gate semantics`;`step-4: fix funnel snapshot dates and OCF streak` |
+| 4 | Universe + L0/L1 Gate + 漏斗輸出 | 2026-08-20 | 是 | `step-4: implement universe gates and funnel`;`step-4: fix financial gates and industry split`;`step-4: correct quarterly financial gate semantics`;`step-4: fix funnel snapshot dates and OCF streak`;`step-4: harden cache and PIT date guards` |
 
 ---
 
@@ -50,7 +50,7 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 4 | Beneish M-score 只標記缺資料,尚未計算 | SPEC §5.2 說 Beneish 是 flag 非 exclusion；完整 M-score 需要跨期財報欄位與 Step 7 財務因子資料整理。目前缺輸入時輸出 `null` 並設 `beneish_m_unavailable` | 是，Step 7 財務因子補齊跨期輸入後實作 |
 | 4 | `capital_raise` gate 暫停顯示為 active step | FinMind 三表目前未提供可直接驗證的「一年內現金增資規模」欄位；用股本或資本公積變化會混入非現金/股票股利等事件,不符合 SPEC 的現金增資語意 | 是，找到 MOPS/TWSE 可驗證現金增資來源後補；在此之前不得顯示成刷 0 檔的 gate |
 | 4 | 「資料完整度 >= 門檻」階段目前是 pass-through | Step 8 才會有因子 raw/normalized 值與 missing ratio,Step 4 尚無資料完整度可計算 | 是，Step 8 scoring/missing 處理完成後接上 |
-| 4 | L0 `security_type` / `exclude_markets` 兩關目前實測各刷 0 檔 | 官方 listing provider 目前只接 TWSE/TPEx 上市櫃普通股清單,未納入 ETF/ETN/REIT/TDR/特別股與興櫃；因此這兩關保留 config 驅動邏輯,但 current source 下無可刷標的 | 是，若後續 listing provider 擴大到 ETF/興櫃來源,這兩關會開始生效 |
+| 4 | L0 `security_type` / `exclude_markets` 兩關目前實測各刷 0 檔 | 官方 listing provider 未納入 ETF/ETN/REIT/特別股與興櫃；但 TWSE 產業代碼 91 的 10 檔 TDR 目前被錯標為 `COMMON_STOCK`。實測 TDR 均未通過成交金額 gate，故現行漏斗結果不受影響，但 `security_type` 語意仍不完整 | 是，接可驗證的證券類型來源後將 TDR 標為 `TDR`，由既有 `security_type` gate 排除 |
 | 4 | 歷史 `as_of` 的注意股/處置股/全額交割股完整 PIT 名單 | TWSE/TPEx altered-trading 端點包含無日期的當前 snapshot，無法證明歷史狀態；目前 `as_of < today` 會中止並報錯，不再把今天名單回套歷史 | 是，進入歷史回測前需接官方歷史公告 archive；未接前僅允許 current-as-of warning gate |
 | 4 | 移除 TWSE/TPEx OpenAPI SSL 失敗時的未驗證憑證 fallback | Windows 本機信任鏈實測無法驗過部分官方端點；stdlib 沒有可攜的指定 CA bundle，而新增 `certifi` 等依賴依 CLAUDE.md 必須先取得人類同意。本步只揭露風險，不靜默宣稱 TLS 已驗證 | 是，正式部署前由人類決定受信任 CA bundle/企業憑證來源，改用 `ssl.create_default_context(cafile=...)` 後移除 `_create_unverified_context()` |
 
@@ -98,7 +98,7 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 9 | TWSE OpenAPI 部分資料集回傳 mojibake 欄位名 | 官方上市櫃清單與財報 snapshot parser | 已處理:正常中文/英文 key 優先,若不存在則依官方欄位順序 fallback；測試覆蓋 mojibake/位置 fallback |
 | 10 | 官方財報 OpenAPI 只提供目前 snapshot,不提供歷史季度查詢 | 歷史 `as_of` 的 Altman Z L1 gate | 已修正:Step 4 L1 財務來源改用 FinMind `get_financials()` long format pivot,沿用 Step 2 Q4 +75d / 其餘 +45d 的 `publish_date` 推導；TWSE/TPEx official provider 僅保留 listing/warnings |
 | 11 | 非製造業分類原本只命中 `17` 金融保險 | Altman Z'' 分流 | 已修正:TWSE/TPEx 分別建立非製造業代碼表,涵蓋 14/15/16/17/18/20/23/29/30/32/34/36/37/38；`as_of=2026-08-19` current listing 命中 548/1,985 = 27.6% |
-| 12 | 全市場預設 L1 改用 FinMind 財報後,首次無快取執行成本很高 | Step 4 全市場執行 | FinMind 三個財報 dataset 實測 `data_id=None` 皆回 0 筆,必須逐檔抓。已改成每檔完成即落獨立快取,避免約 2,247 requests 中途失敗時整批歸零。2026-08-20 首次完成 749 檔、724,459 列三表回補；跨年度 OCF streak 補修後全市場結果 749→525 |
+| 12 | 全市場預設 L1 改用 FinMind 財報後,首次無快取執行成本很高 | Step 4 全市場執行 | FinMind 三個財報 dataset 實測 `data_id=None` 皆回 0 筆,必須逐檔抓。每檔獨立落盤避免中途失敗歸零；快取 key 已由精確日期改成季度邊界，同一已結束財報期內相鄰 `as_of` 共用快取，回傳前仍依原始 `start/end` 與 `publish_date <= as_of` 過濾。首次建立新季度 key 仍約 2,247 requests，之後日常執行不再每日全量重抓 |
 | 13 | FinMind 財報與官方 OpenAPI 財報單位不同 | Altman X4 | 已修正:Step 4 既已改用 FinMind 財報,市值與財報都用元級,不再將 `market_value` 除以 1,000。單檔 smoke 確認 2330 不再被 Altman 單位錯誤剔除 |
 | 14 | FinMind 現金流量表是年初至今累計值 | L1 negative OCF | 已修正:同一會計年度內先差分成單季,Q1 採原值,Q2–Q4 減前季累計；差分完成後負季 streak 在完整季度序列上計算,可跨會計年度。全市場分布為 0/1/2/3/4/5/6/7 季 = 490/115/83/22/20/5/7/7；L1 negative OCF 639→525。真實 2399 最新單季 `-117,580 - (-122,108) = +4,528`,仍正確為 0 |
 | 15 | FinMind 損益表是單季值,Altman X3/X5 要年度值 | L1 Altman Z | 已修正:EBIT 與 Revenue 使用最近連續四季 TTM 加總；不足四季回傳 null。真實 2439 TTM Z=`2.385808`,不再被單季 Z=`1.342` 誤剔除 |
@@ -106,6 +106,10 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 17 | Official OpenAPI client 在 Windows 憑證鏈失敗時使用 `ssl._create_unverified_context()` | 官方 listing/warning 傳輸安全 | 已揭露於跳過表；未新增 SPEC 未列依賴。正式部署前必須由人類指定受信任 CA bundle/企業憑證來源並移除未驗證 fallback |
 | 18 | 全市場 L1 剔除 224 檔，高於 SPEC §5.2 預期的 50–150 檔 | Universe 漏斗 | 不調整 gate 參數；warning 29、Altman 81、negative OCF 114 的資料語意已驗證。依禁止事項不得為湊區間改門檻，留到 Step 12 sensitivity 分析 |
 | 19 | TWSE OpenAPI 大型 listing payload 曾發生 `IncompleteRead` | current universe/漏斗交付指令 | 已修正:截斷回應只重試一次；第二次仍截斷或請求失敗時轉成 `OfficialMarketDataError` 中止並報錯，不回傳部分資料或空 DataFrame |
+| 20 | 財報快取原本綁定精確 `start/end`，相鄰 `as_of` 無法重用 | 每日漏斗、Step 11 回填、Step 12 敏感度 | 已修正:請求與 key 對齊季度邊界；季度推導公布期限前每日刷新、期限後視為固定資料。測試確認 8/19 與 8/20 共用同一份逐符號快取，且 PIT/查詢區間過濾仍套用 |
+| 21 | `warnings_snapshot > as_of` 原本可由 stub provider 繞過 | builder PIT 邊界 | 已修正:builder 增加對稱守衛並拋 `UniverseGateError`；官方 provider 仍額外要求 snapshot 必須等於執行日 |
+| 22 | listing snapshot 原用 `as_of`，L0 價量使用 `latest_trade_date` | 新上市股票的 L0 語意 | 已修正:listing 與 L0 均以實際 `latest_trade_date` 為基準，避免兩日期間新上市但尚無價量的股票混入初始 universe |
+| 23 | TWSE 產業代碼 91 的 TDR 被標為 `COMMON_STOCK` | L0 security type | 已揭露:目前 10 檔實測均在成交金額 gate 被剔除，現行結果不變；尚未接可驗證的 security type source，不以產業代碼自行偽造完整類型映射 |
 
 ---
 
@@ -120,3 +124,4 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 2026-08-19 | 4 | CONDITIONAL | 需補非製造業代碼表、L1 改用 FinMind 財報、negative OCF 真正接現金流量表、揭露 capital_raise/資料完整度/L0 零刷關卡 |
 | 2026-08-20 | 4 | CONDITIONAL | 需補 cumulative OCF 單季差分、Altman X3/X5 TTM、歷史 warning snapshot 中止、no-data gate 明示 skipped、移除死常數與財報 pivot 向量化，並重跑全市場 L1 |
 | 2026-08-20 | 4 | CONDITIONAL | 需拆分價量截止日與 current warning snapshot，讓單一 CLI 指令可重現且明示混合日期；negative OCF 差分後的 streak 必須跨會計年度；另揭露未驗證 SSL fallback |
+| 2026-08-20 | 4 | PASS | funnel 單一指令與三日期標註、OCF 五個跨年/反向案例及全市場 0–7 季分布均由審查者獨立驗證通過；可進 Step 5 |
