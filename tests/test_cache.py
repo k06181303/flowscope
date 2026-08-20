@@ -35,6 +35,30 @@ def test_no_cache_forces_fetch(tmp_path) -> None:  # type: ignore[no-untyped-def
     assert third["value"].to_list() == [2]
 
 
+def test_explicitly_allowed_empty_result_is_cached(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    cache = ParquetCache(tmp_path)
+    key = CacheKey(
+        provider="finmind",
+        method="daily_bulk_TaiwanStockDividendResult",
+        symbol_hash="all",
+        start=date(2024, 1, 2),
+        end=date(2024, 1, 2),
+    )
+    calls = 0
+
+    def fetch() -> pl.DataFrame:
+        nonlocal calls
+        calls += 1
+        return pl.DataFrame(schema={"date": pl.Utf8, "stock_id": pl.Utf8})
+
+    first = cache.get_or_fetch(key, fetch, no_cache=False, cache_empty=True)
+    second = cache.get_or_fetch(key, fetch, no_cache=False, cache_empty=True)
+
+    assert first.is_empty()
+    assert second.is_empty()
+    assert calls == 1
+
+
 def test_financial_cache_refreshes_until_publish_deadline_then_becomes_immutable(
     tmp_path,  # type: ignore[no-untyped-def]
 ) -> None:

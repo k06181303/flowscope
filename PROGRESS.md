@@ -6,11 +6,11 @@
 
 ## 目前狀態
 
-**Step 4 已通過審查；進入 Step 5 前處理非阻擋建議。**
+**Step 5 技術面因子與正式共線性診斷已完成，DoD 與品質三關達成；等待 Step 5 審查，不得進入 Step 6。**
 
-下一步:完成財報快取/PIT 日期前置修正後進入 SPEC §13 **Step 5 — 技術面因子 T01–T21**
+下一步:依 `docs/FlowScope_Review_Protocol.md` 進行 Step 5 審查；審查 PASS 前不得開始 Step 6。
 
-DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `flowscope diagnose funnel --as-of 2026-08-20 --price-as-of 2026-08-19 --warnings-snapshot today` 可明示資料截止日、最近已完成交易日與 current warning snapshot。2026-08-20 實跑全市場:1,985 → L0 749 → L1 525。L1 逐關為 warnings 749→720、TTM Altman 720→639、跨會計年度 negative OCF streak 639→525；capital raise 明示 `skipped (no data)`。
+DoD:T01–T21 均有手算 golden、資料不足 `null`、退化輸入測試；正式 CLI 以真實 L0 749 檔、250 日、全 21 因子輸出含 `as_of` 的 Parquet、Spearman CSV、pairwise `n`、95% CI、`n_eff` 與 `factor_priority` 建議。最終 enabled 集合內任兩因子 |ρ| ≤ 0.70。最新品質結果:Ruff 通過、mypy strict 22 source files、161 passed、總 coverage 88.80%，`factors/technical.py` 93%、`factors/diagnostics.py` 91%。
 
 ---
 
@@ -22,6 +22,7 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 2 | 資料層:FinMind provider + Parquet 快取 + 交易日曆 + 除權息還原 | 2026-08-19 | 是 | `step-2: implement FinMind data layer`;`step-2: fix FinMind batching safeguards` |
 | 3 | 集保 provider (FinMind) + 解析 + PIT 對齊 | 2026-08-19 | 是 | `step-3: implement FinMind holder distribution`;`step-3: tighten holder data safeguards` |
 | 4 | Universe + L0/L1 Gate + 漏斗輸出 | 2026-08-20 | 是 | `step-4: implement universe gates and funnel`;`step-4: fix financial gates and industry split`;`step-4: correct quarterly financial gate semantics`;`step-4: fix funnel snapshot dates and OCF streak`;`step-4: harden cache and PIT date guards` |
+| 5 | 技術面因子 T01–T21 + 全市場多日共線性診斷 | 2026-08-20 | 是 | `step-5: implement technical factors and collinearity diagnostics` |
 
 ---
 
@@ -53,6 +54,9 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 4 | L0 `security_type` / `exclude_markets` 兩關目前實測各刷 0 檔 | 官方 listing provider 未納入 ETF/ETN/REIT/特別股與興櫃；但 TWSE 產業代碼 91 的 10 檔 TDR 目前被錯標為 `COMMON_STOCK`。實測 TDR 均未通過成交金額 gate，故現行漏斗結果不受影響，但 `security_type` 語意仍不完整 | 是，接可驗證的證券類型來源後將 TDR 標為 `TDR`，由既有 `security_type` gate 排除 |
 | 4 | 歷史 `as_of` 的注意股/處置股/全額交割股完整 PIT 名單 | TWSE/TPEx altered-trading 端點包含無日期的當前 snapshot，無法證明歷史狀態；目前 `as_of < today` 會中止並報錯，不再把今天名單回套歷史 | 是，進入歷史回測前需接官方歷史公告 archive；未接前僅允許 current-as-of warning gate |
 | 4 | 移除 TWSE/TPEx OpenAPI SSL 失敗時的未驗證憑證 fallback | Windows 本機信任鏈實測無法驗過部分官方端點；stdlib 沒有可攜的指定 CA bundle，而新增 `certifi` 等依賴依 CLAUDE.md 必須先取得人類同意。本步只揭露風險，不靜默宣稱 TLS 已驗證 | 是，正式部署前由人類決定受信任 CA bundle/企業憑證來源，改用 `ssl.create_default_context(cafile=...)` 後移除 `_create_unverified_context()` |
+| 5 | 臨時停市資料品質事件尚未寫入 run manifest | Step 9 才會建立 manifest；Step 5 已由 `FinMindProvider.data_quality_events` 保存結構化事件，不再只依賴容易被沖掉的 `RuntimeWarning` | 是，Step 9 manifest 寫入時必須序列化 provider data-quality events |
+| 5 | `tests/fixtures/` 目錄仍未建立 | 21 個 technical golden 的期望值均為人工手算，算式與來源直接寫在各測試旁；審查者已確認品質可接受，為了建立目錄而搬移不增加獨立性 | 否；未來若 golden 資料量大到不適合內嵌，才建立外部 fixture，且期望值仍不得由被測程式產生 |
+| 5 | `compute_technical_factor_history` 未做分批落盤與重複 PIT 分組效能優化 | 正式 749×250×21 已正確完成，但實測約 103 分鐘、working set 超過 1 GB。執行途中改演算法會使正式證據與測試版本不一致 | 是，Step 12 大量敏感度重跑前優化；必須以目前 3,932,250 列輸出做等值回歸測試，不得改變 PIT/null 語意 |
 
 ---
 
@@ -77,6 +81,11 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 15 | **FinMind 財報無公布日欄位**(2026-08-19 實測確認) | **已決定** | 實測回傳欄位僅 `date`(期別)/`origin_name`/`stock_id`/`type`/`value`。`publish_date` 須自行推導,**Q4 用 +75 天**而非 +45 天。此為 Phase 1 最大 PIT 風險點,Step 2 須以 Review Protocol §2.1 方法驗證。財報為 long format,Altman Z / Beneish M 輸入需先 pivot |
 | 16 | FinMind 訂閱方案 | **已決定** | **Backer($699/月)**。2026-08-19 實測 17 個 Phase 1 dataset 全部可存取。$999 多的分點/分K/即時報價 Phase 1 均用不到(SPEC §4.4 明列分點不實作)。速率 1,600 req/hr,**回補必須按日期批次下載,不得逐檔查詢** |
 | 17 | **G6** `securities_lending_balance` FinMind 無日末餘額(2026-08-19 實測確認) | **已決定** | `TaiwanStockSecuritiesLending` 欄位為 `transaction_type`/`volume`/`fee_rate`/`original_return_date`,是逐筆借券交易明細,非日末餘額;無期初餘額不得推導。**決定:另尋 TWSE 借券餘額來源**。在來源接上前 `get_margin` 的此欄位維持 `null` 並記錄,不得以明細淨額偽造 |
+| 18 | **FinMind 交易日曆漏掉臨時停市**（2026-08-20 實測確認） | **已決定（選項 A）** | `TaiwanStockTradingDate` 僅作候選日；某日全市場 `TaiwanStockPrice` 有資料才列為交易日。全市場零筆須確認 API 成功且前後市場日資料正常才記錄為臨時停市；API 錯誤或無法交叉確認時中止。SPEC §4.2 已修訂 |
+| 19 | **T05/T06 benchmark 價格指數與還原股價口徑不一致**（2026-08-20 發現） | **已決定** | 保留 FinMind `TaiwanStockTotalReturnIndex`（`data_id=TAIEX`）含息報酬指數。個股因子使用除權息還原價，benchmark 同樣使用總報酬口徑；SPEC §6.1 已修訂，不採 `TaiwanStockPrice data_id=TAIEX` 價格指數 |
+| 20 | **股利事件逐檔成功空集合無法區分無事件與 API 異常**（2026-08-20 實測 1718） | **已決定（方案 B）** | `TaiwanStockDividendResult` 改為逐實際交易日全市場 bulk，每次固定 `start=end`；同日全市場價量存在且股利成功空集合時代表當日無事件。禁止整段 bulk，因 FinMind 會靜默只回 `start_date` 當日 |
+| 21 | `AGENTS.md` 與 `CLAUDE.md` 是否維持完全相同 | **已決定** | 三項回報誠實性要求同步至 `CLAUDE.md`；Codex 專用的純文字 code block 格式只留在 `AGENTS.md`，兩檔明示適用範圍 |
+| 22 | FinMind OHLC 全零但仍有零股量額的價格列如何處理 | **已決定** | OHLC 四欄全 0 視為沒有可用整股價格。L0 不計有效成交日但保留 `amount` 於平均；因子層排除；不以量額反推、不填補、不 forward fill，歷史不足回 `null` |
 
 > **G2/G4 的副作用(審查時必讀):** L1 少掉兩條排除條件,實際攔截檔數會低於 SPEC §5.2 預期的 50–150 檔。
 > 這是已知且已接受的缺口,**不得為了把數字湊回預期區間而放寬其他 L1 門檻**——那違反 SPEC §15 第 8 條。
@@ -110,6 +119,25 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 21 | `warnings_snapshot > as_of` 原本可由 stub provider 繞過 | builder PIT 邊界 | 已修正:builder 增加對稱守衛並拋 `UniverseGateError`；官方 provider 仍額外要求 snapshot 必須等於執行日 |
 | 22 | listing snapshot 原用 `as_of`，L0 價量使用 `latest_trade_date` | 新上市股票的 L0 語意 | 已修正:listing 與 L0 均以實際 `latest_trade_date` 為基準，避免兩日期間新上市但尚無價量的股票混入初始 universe |
 | 23 | TWSE 產業代碼 91 的 TDR 被標為 `COMMON_STOCK` | L0 security type | 已揭露:目前 10 檔實測均在成交金額 gate 被剔除，現行結果不變；尚未接可驗證的 security type source，不以產業代碼自行偽造完整類型映射 |
+| 24 | `financial_cache_window` 在 `end` 恰為季末日（例如 2026-09-30）時產生獨立快取窗口 | 每季季末日的 L1 財報快取 | 已記錄，不影響正確性；季末當天不與前後日共用快取，會觸發全量重抓，一年最多四次。依使用者指示本輪不修改 |
+| 25 | `TaiwanStockTradingDate` 將 2026-07-10 颱風停市列為交易日，但全市場與 2330 價量均為零筆 | Step 2 交易日曆、Step 5 歷史價量回補 | 已依待決表 #18 修正：候選日再以全市場實際價量確認；成功空集合只有在前後資料正常時才視為臨時停市，其他錯誤仍中止 |
+| 26 | T05/T06 原 SPEC 寫「加權指數」但未明定價格或含息報酬口徑 | 技術面相對強弱因子 | 已依待決表 #19 修訂 SPEC：統一使用 `TaiwanStockTotalReturnIndex` 含息報酬指數，與個股除權息還原價保持總報酬口徑一致 |
+| 27 | `TaiwanStockDividendResult` 不帶 `data_id` 的區間 bulk 會靜默只回 `start_date` 當日 | PIT 還原價、所有技術因子 | 實測 2026-07 整月只回 07-01 的 38 筆，逐日合計 743 筆，會漏 705 筆；已依待決表 #20 改為逐交易日 bulk，並以測試強制每次 `start=end`，不得改回區間 bulk |
+| 28 | `AGENTS.md` 新增可複製報告規則後與原本相同的 `CLAUDE.md` 產生差異 | Codex/Claude 協作規範一致性 | 已依待決表 #21 處理：誠實性要求同步，Codex 專用格式不強加給 Claude，兩檔明示各自適用範圍 |
+| 29 | FinMind 在只有零股成交、沒有整股成交時回傳 OHLC 全 0，但保留零股 `volume`/`amount` | L0 流動性 gate、所有技術因子 | 已依待決表 #22 使用共用判定。L0 成交日分子排除但 `amount` 平均保留；因子窗口排除。2026-08-19 結束的 518 日、749 檔快取中有 76 列 OHLC 全零，其中 26 列仍有量額；不得誤報為資料缺失 |
+| 30 | 正式 749 檔 × 250 日 × 21 因子診斷耗時與記憶體偏高 | Step 5 共線性 CLI、後續 Step 12 重跑 | 2026-08-20 實測約 103 分鐘，working set 曾超過 1 GB。現行 `compute_technical_factor_history` 每個 `as_of` 重做 PIT filter/sort/partition，且完成前不分批落盤、無進度顯示。正確性輸出已完成；效能優化未納入本次 Step 5 commit，後續須以等值輸出測試保護後再改 |
+
+---
+
+## Step 5 正式共線性結果（2026-08-20）
+
+- 指令:`flowscope diagnose collinearity --market TW --horizon swing --as-of 2026-08-19 --lookback 250`
+- 範圍:真實 L0 749 檔、250 個 PIT `as_of`（2025-08-08～2026-08-19）、T01–T21 全 21 因子。
+- 輸出:`technical_factors.parquet` 3,932,250 列，含 `as_of`；非 null `raw_value` 無 NaN/Inf。Spearman CSV 為 21×21 矩陣。
+- 有效自由度:`n_eff = 5.514`。
+- |ρ| > 0.70 共 12 組:`T05/T08 .9639`、`T05/T06 .8472`、`T01/T08 .8182`、`T06/T08 .8117`、`T01/T05 .7668`、`T02/T08 .7629`、`T02/T05 .7513`、`T19/T20 .7448`、`T01/T19 .7442`、`T01/T03 .7283`、`T01/T02 .7142`、`T03/T19 .7088`。CLI 已逐組輸出 pairwise `n`、Fisher z 95% CI 與建議保留者。
+- 依 `factor_priority` 對原 enabled 集合做確定性取捨:停用 T01、T02、T19，保留 T03、T05、T10、T11、T13、T15、T18、T21；最後 enabled 集合內任兩因子 |ρ| ≤ 0.70。三個停用因子參數移至 `diagnostic_params`，仍納入未來全 21 因子診斷。
+- 此處只依共線性硬門檻去重，未使用未來報酬、未最佳化權重，也未宣稱停用後績效較好。
 
 ---
 
@@ -125,3 +153,4 @@ DoD:輸出 §5.3 格式的漏斗;L0/L1 各關剩餘檔數合理。交付指令 `
 | 2026-08-20 | 4 | CONDITIONAL | 需補 cumulative OCF 單季差分、Altman X3/X5 TTM、歷史 warning snapshot 中止、no-data gate 明示 skipped、移除死常數與財報 pivot 向量化，並重跑全市場 L1 |
 | 2026-08-20 | 4 | CONDITIONAL | 需拆分價量截止日與 current warning snapshot，讓單一 CLI 指令可重現且明示混合日期；negative OCF 差分後的 streak 必須跨會計年度；另揭露未驗證 SSL fallback |
 | 2026-08-20 | 4 | PASS | funnel 單一指令與三日期標註、OCF 五個跨年/反向案例及全市場 0–7 季分布均由審查者獨立驗證通過；可進 Step 5 |
+| 2026-08-20 | 5 | 待審查 | T01–T21、零股日共同判定、250 日全市場共線性、CSV/n_eff/CI、factor_priority 去重與 161 passed 已完成；審查 PASS 前不進 Step 6 |

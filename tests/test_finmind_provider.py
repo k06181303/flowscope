@@ -16,6 +16,7 @@ from flowscope.data.providers.finmind import (
     financial_cache_window,
     financial_publish_date,
     latest_balance_lookup,
+    longest_consecutive_missing_dates,
     month_end,
     next_month_tenth,
     parse_holding_level,
@@ -54,6 +55,11 @@ class StaticClient:
                 {"date": "2024-01-03", "stock_id": "2330", "market_value": 110_000.0},
                 {"date": "2024-01-04", "stock_id": "2330", "market_value": 90_000.0},
             ]
+        if request.dataset == "TaiwanStockTotalReturnIndex":
+            return [
+                {"date": "2024-01-02", "stock_id": "TAIEX", "price": 100.0},
+                {"date": "2024-01-03", "stock_id": "TAIEX", "price": 101.0},
+            ]
         if request.dataset == "TaiwanStockBalanceSheet":
             return [
                 {
@@ -72,6 +78,10 @@ class StaticClient:
                 },
             ]
         if request.dataset == "TaiwanStockDividendResult":
+            if request.data_id is None:
+                assert request.start == request.end
+                if request.start != date(2024, 1, 4):
+                    return []
             return [
                 {
                     "date": "2024-01-04",
@@ -205,6 +215,99 @@ def test_provider_uses_one_bulk_request_per_trading_date_for_multiple_symbols(
     }
 
 
+def test_trading_calendar_excludes_confirmed_emergency_closure(tmp_path: Path) -> None:
+    class EmergencyClosureClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            if (
+                request.dataset == "TaiwanStockPrice"
+                and request.data_id is None
+                and request.start == date(2024, 1, 3)
+            ):
+                return []
+            return super().fetch_rows(request)
+
+    provider = FinMindProvider(
+        data_root=tmp_path,
+        no_cache=True,
+        client=EmergencyClosureClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.warns(RuntimeWarning, match="recording it as an emergency closure"):
+        calendar = provider.get_trading_calendar(date(2024, 1, 2), date(2024, 1, 4))
+
+    assert calendar.dates == (date(2024, 1, 2), date(2024, 1, 4))
+    assert len(provider.data_quality_events) == 1
+    assert provider.data_quality_events[0].code == "emergency_market_closure"
+    assert provider.data_quality_events[0].data_date == date(2024, 1, 3)
+
+
+def test_trading_calendar_does_not_treat_price_api_failure_as_closure(tmp_path: Path) -> None:
+    class FailedPriceClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            if (
+                request.dataset == "TaiwanStockPrice"
+                and request.data_id is None
+                and request.start == date(2024, 1, 3)
+            ):
+                raise FinMindError("simulated price API failure")
+            return super().fetch_rows(request)
+
+    provider = FinMindProvider(
+        data_root=tmp_path,
+        no_cache=True,
+        client=FailedPriceClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(FinMindError, match="simulated price API failure"):
+        provider.get_trading_calendar(date(2024, 1, 2), date(2024, 1, 4))
+
+
+def test_trading_calendar_rejects_all_market_empty_range_as_data_failure(tmp_path: Path) -> None:
+    class EmptyPriceClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            if request.dataset == "TaiwanStockPrice" and request.data_id is None:
+                return []
+            return super().fetch_rows(request)
+
+    provider = FinMindProvider(
+        data_root=tmp_path,
+        no_cache=True,
+        client=EmptyPriceClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(FinMindError, match="too many consecutive successful empty"):
+        provider.get_trading_calendar(date(2024, 1, 2), date(2024, 1, 4))
+
+
+def test_trading_calendar_rejects_more_than_two_consecutive_empty_candidates(
+    tmp_path: Path,
+) -> None:
+    class LongEmptyRunClient(StaticClient):
+        def fetch_rows(self, request: FinMindRequest) -> list[dict[str, Any]]:
+            if (
+                request.dataset == "TaiwanStockPrice"
+                and request.data_id is None
+                and request.start in {date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 8)}
+            ):
+                return []
+            return super().fetch_rows(request)
+
+    provider = FinMindProvider(
+        data_root=tmp_path,
+        no_cache=True,
+        client=LongEmptyRunClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(FinMindError, match="too many consecutive successful empty"):
+        provider.get_trading_calendar(date(2024, 1, 2), date(2024, 1, 9))
+
+
+def test_longest_consecutive_missing_dates_uses_candidate_order() -> None:
+    candidates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 8)]
+
+    assert longest_consecutive_missing_dates(candidates, {candidates[0], candidates[-1]}) == 2
+
+
 def test_get_price_history_returns_raw_prices_without_share_lookup(tmp_path: Path) -> None:
     client = StaticClient()
     provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=client)  # type: ignore[arg-type]
@@ -223,6 +326,47 @@ def test_get_price_history_returns_raw_prices_without_share_lookup(tmp_path: Pat
     assert not any(call.dataset == "TaiwanStockBalanceSheet" for call in client.calls)
 
 
+def test_get_adjusted_price_history_avoids_share_lookup(tmp_path: Path) -> None:
+    client = StaticClient()
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=client)  # type: ignore[arg-type]
+
+    df = provider.get_adjusted_price_history(
+        ["2330"],
+        date(2024, 1, 2),
+        date(2024, 1, 4),
+    )
+
+    # 1/4 除權比率=90/100；事件前 1/2、1/3 價格乘 0.9，事件當日不調整。
+    assert df["close"].to_list() == pytest.approx([90.0, 99.0, 90.0])
+    assert not any(
+        call.dataset in {"TaiwanStockMarketValue", "TaiwanStockBalanceSheet"}
+        for call in client.calls
+    )
+
+
+def test_dividend_result_bulk_is_requested_once_per_trading_date(tmp_path: Path) -> None:
+    client = StaticClient()
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=client)  # type: ignore[arg-type]
+
+    provider.get_adjusted_price_history(
+        ["2330", "2317"],
+        date(2024, 1, 2),
+        date(2024, 1, 4),
+    )
+
+    dividend_calls = [
+        call for call in client.calls if call.dataset == "TaiwanStockDividendResult"
+    ]
+    assert len(dividend_calls) == 3
+    assert all(call.data_id is None for call in dividend_calls)
+    assert all(call.start == call.end for call in dividend_calls)
+    assert {call.start for call in dividend_calls} == {
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+    }
+
+
 def test_get_market_values_maps_publish_date(tmp_path: Path) -> None:
     provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=StaticClient())  # type: ignore[arg-type]
 
@@ -237,6 +381,17 @@ def test_get_market_values_maps_publish_date(tmp_path: Path) -> None:
     assert df["market_value"].to_list() == pytest.approx([100_000.0, 110_000.0, 90_000.0])
 
 
+def test_get_benchmark_history_maps_taiex_total_return_index(tmp_path: Path) -> None:
+    provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=StaticClient())  # type: ignore[arg-type]
+
+    df = provider.get_benchmark_history(date(2024, 1, 2), date(2024, 1, 3))
+
+    assert df.select("data_date", "publish_date", "benchmark_close").rows() == [
+        (date(2024, 1, 2), date(2024, 1, 2), 100.0),
+        (date(2024, 1, 3), date(2024, 1, 3), 101.0),
+    ]
+
+
 def test_daily_bulk_fetch_raises_when_returned_dates_do_not_match_calendar(
     tmp_path: Path,
 ) -> None:
@@ -248,7 +403,7 @@ def test_daily_bulk_fetch_raises_when_returned_dates_do_not_match_calendar(
 
     provider = FinMindProvider(data_root=tmp_path, no_cache=True, client=BadBulkClient())  # type: ignore[arg-type]
 
-    with pytest.raises(FinMindError, match="returned dates do not match trading calendar"):
+    with pytest.raises(FinMindError, match="full-market request returned unexpected dates"):
         provider.get_ohlcv(["2330", "2317"], date(2024, 1, 2), date(2024, 1, 4), adjusted=False)
 
 

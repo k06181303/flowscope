@@ -14,6 +14,11 @@
 | 2026-08-18 | §8.5 | 取消台股整張(1000 股)限制,允許零股 | 使用者裁定(§14-1) |
 | 2026-08-19 | §3 | 目錄結構同步:`finmind.py` 涵蓋集保,`tdcc.py` 標註為 Phase 2 備援不建立 | 同上,補漏 |
 | 2026-08-19 | §4.2 | 除權息還原改為 `as_of` 基準,不得使用 `as_of` 之後才發生或才公開的事件回算歷史 | Step 2 審查指出「以最新價為基準」與 PIT 原則矛盾;使用者裁定直接修訂 SPEC |
+| 2026-08-20 | §4.2 | 交易日曆改以 `TaiwanStockTradingDate` 為候選日、全市場實際價量為最終交易日；臨時停市日不得留在日曆 | FinMind 日曆錯列 2026-07-10 颱風停市；使用者裁定選項 A |
+| 2026-08-20 | §6.1 T05/T06 | benchmark 明定使用臺灣加權股價報酬指數（含息） | 個股技術因子使用除權息還原價，benchmark 必須採相同總報酬口徑；使用者裁定依建議修訂 |
+| 2026-08-20 | §6.6、§11 | 共線性診斷明定使用 L0 全股票池、全因子與多日 PIT 橫斷面；報告增加樣本數、95% CI、CSV 與 `n_eff` | Step 5 中期審查指出單日 40 檔、僅 enabled 因子不足以支持停用因子的結論 |
+| 2026-08-20 | §5.1、§6.0 | OHLC 四欄全為 0 的零股成交日不視為有效整股交易日，且不得納入技術因子窗口 | TWSE 無整股成交時不提供整股 OHLC，但 FinMind 仍保留零股量額；零股價格不足以重建 high/low |
+| 2026-08-20 | 附錄 A | T01、T02、T19 改為 diagnostic-only | 749 檔 L0、250 日、全 21 因子正式 Spearman 診斷；依 `factor_priority` 移除 enabled 集合內的所有 \|ρ\| > 0.70 配對 |
 
 詳細查證見 `docs/FinMind_API_Inventory.md`;人類裁定紀錄見 `PROGRESS.md`。
 
@@ -209,6 +214,7 @@ def as_of_filter(df: pl.DataFrame, as_of: date) -> pl.DataFrame:
 3. **股票代號變更 / 合併**:維護 `data/processed/symbol_map.parquet`,欄位 `(old_id, new_id, effective_date)`。
 4. **處置股 / 全額交割股 / 注意股**:必須抓取並在 Gate 排除(見 §5.2)。
 5. **股本變動**:計算週轉率、籌碼比例時,分母須使用 `as_of` 當時的流通在外股數,不得使用最新值。
+6. **交易日曆**:`TaiwanStockTradingDate` 只作候選日來源，最終交易日以該日全市場 `TaiwanStockPrice` 是否有實際資料判定。全市場零筆只有在 API 明確成功且前後均有成功市場資料時才記錄為臨時停市；API 錯誤、連續異常空資料或無法交叉確認時必須中止，不得把資料故障偽裝成停市。
 
 ### 4.3 Provider Protocol
 
@@ -288,6 +294,8 @@ class MetaProvider(Protocol):
 | 排除類型 | ETF、ETN、REIT、TDR、特別股、存託憑證 | `gates.l0.exclude_types` |
 | 排除市場 | 興櫃 | `gates.l0.exclude_markets` |
 
+FinMind 的 OHLC 四欄全為 0、但 `volume`/`amount` 可能非 0 的列，代表當日只有零股成交、沒有可用的整股 OHLC。這類列不計入「有交易的天數比例」分子；但零股 `amount` 仍納入 20 日平均成交金額，避免剔除低量日後反而高估流動性。這是刻意的不對稱處理。
+
 ### 5.2 L1 排雷閘門(財務面只在這裡出現)
 
 **布林判定,不參與加權。** 任一條成立即排除:
@@ -361,6 +369,8 @@ class Factor(Protocol):
 - 資料不足一律回傳 `null`,絕不以 0 或均值填補(填補交給 §7 統一處理)
 - 每個因子都必須有對應的 golden fixture 單元測試
 
+OHLC 四欄全為 0 的零股成交列不得納入任何技術因子的歷史窗口。不得用 `amount / volume` 反推價格，因其只有零股成交價且無法重建 high/low；不得 forward fill 或填補 0/均值。排除後歷史不足時，該因子依上述規則回傳 `null`。L0 的 20 日窗口與技術因子的長窗口不同，因此兩層必須各自套用同一判定。
+
 ---
 
 ### 6.1 技術面因子 (`technical.py`)
@@ -404,7 +414,7 @@ value = 1 if 多方, -1 if 空方
 **T05 `relative_strength_pct`** — **本族群最重要的因子**
 ```
 r_stock = close[t] / close[t-N] - 1     N = 60 (swing)
-r_bench = 加權指數同期報酬
+r_bench = 臺灣加權股價報酬指數同期報酬（含息；TaiwanStockTotalReturnIndex, data_id=TAIEX）
 rs_raw  = (1 + r_stock) / (1 + r_bench) - 1
 ```
 另計算多窗口版本並取加權:
@@ -414,7 +424,7 @@ rs_composite = 0.4 × RS(20d) + 0.4 × RS(60d) + 0.2 × RS(120d)
 
 **T06 `mansfield_rsi`**
 ```
-RS_line = close / benchmark_close
+RS_line = close / benchmark_close   # benchmark 同 T05，使用臺灣加權股價報酬指數
 MRS = (RS_line / SMA(RS_line, 52週) - 1) × 100
 ```
 Mansfield RSI > 0 表示長期跑贏大盤。
@@ -797,10 +807,13 @@ Piotroski F-Score 可實作但預設 `enabled: false`,留待 Phase 3 長線層�
 flowscope diagnose collinearity --market TW --horizon swing --lookback 250
 ```
 
-輸出:
-1. 全因子的 Spearman 相關係數矩陣(CSV + 終端熱圖)
-2. 所有 |ρ| > 0.7 的配對清單,附建議保留者(依 `factor_priority` config)
-3. 每個維度的有效自由度估計:`n_eff = (Σλ)² / Σλ²`(λ 為相關矩陣特徵值)
+輸入與輸出契約:
+1. 使用 `as_of` 當日的完整 L0 universe，不得以方便回補的小樣本替代。
+2. `lookback=N` 表示匯總最近 N 個交易日的 PIT 因子橫斷面；每列因子值必須包含 `as_of`，觀測鍵為 `(as_of, symbol)`。
+3. 矩陣必須涵蓋該維度的**全部因子**，不只目前 enabled 因子。
+4. 輸出全因子的 Spearman 相關係數矩陣(CSV + 終端矩陣)。
+5. 所有 |ρ| > 0.7 的配對須列出 `rho`、pairwise non-null 樣本數 `n`、Fisher z 近似 95% 信賴區間，以及依 `factor_priority` config 建議保留者。
+6. 每個維度的有效自由度估計:`n_eff = (Σλ)² / Σλ²`(λ 為相關矩陣特徵值)。
 
 **驗收條件:** 最終啟用的因子集合中,任兩個同維度因子的 |ρ| ≤ 0.7。若違反,啟動時發出警告。
 
@@ -1225,11 +1238,25 @@ weights:
 factors:
   technical:
     enabled: [T01, T02, T03, T05, T10, T11, T13, T15, T18, T19, T21]
+    factor_priority: [T05, T02, T03, T01, T10, T11, T13, T15, T18, T19, T21,
+                      T04, T06, T07, T08, T09, T12, T14, T16, T17, T20]
     params:
       T02: { window: 60 }
       T05: { windows: [20, 60, 120], weights: [0.4, 0.4, 0.2] }
       T10: { bb_period: 20, bb_std: 2.0, percentile_window: 250 }
       T19: { pivot_lookback: 60, min_base_days: 15, max_base_range: 0.25 }
+    # disabled 因子仍須由 config 提供診斷參數；不得在程式內放魔術預設值。
+    diagnostic_params:
+      T04: { atr_period: 10, multiplier: 3.0 }
+      T06: { window: 252 }
+      T07: { fast_period: 12, slow_period: 26, signal_period: 9, slope_window: 5, atr_period: 14 }
+      T08: { windows: [20, 60, 120], weights: [0.3, 0.4, 0.3] }
+      T09: { atr_period: 14 }
+      T12: { segment_days: 20, segment_count: 3 }
+      T14: { period: 20 }
+      T16: { window: 20 }
+      T17: { window: 20 }
+      T20: { ma_window: 20, atr_period: 14 }
   chips:
     holder_mode: composite
     enabled: [C05, C06, C07, C08, C11, C12, C15, C17]
@@ -1350,8 +1377,8 @@ flowscope report run --run-id 20260818T163000Z-a3f9c1
 
 | ID | 名稱 | 維度 | 族群 | Phase 1 啟用 |
 |---|---|---|---|---|
-| T01 | ma_alignment_score | technical | 趨勢 | ✅ |
-| T02 | linreg_slope_r2 | technical | 趨勢 | ✅ |
+| T01 | ma_alignment_score | technical | 趨勢 | ⬜ (正式共線性診斷後改為 diagnostic-only) |
+| T02 | linreg_slope_r2 | technical | 趨勢 | ⬜ (正式共線性診斷後改為 diagnostic-only) |
 | T03 | adx | technical | 趨勢 | ✅ |
 | T04 | supertrend_state | technical | 趨勢 | ⬜ |
 | T05 | relative_strength_pct | technical | 動能 | ✅ |
@@ -1368,7 +1395,7 @@ flowscope report run --run-id 20260818T163000Z-a3f9c1
 | T16 | volume_surge | technical | 量能 | ✅ (planner) |
 | T17 | up_down_volume_ratio | technical | 量能 | ⬜ |
 | T18 | pct_from_52w_high | technical | 結構 | ✅ |
-| T19 | base_breakout | technical | 結構 | ✅ |
+| T19 | base_breakout | technical | 結構 | ⬜ (正式共線性診斷後改為 diagnostic-only) |
 | T20 | distance_to_ma20_atr | technical | 結構 | ✅ (planner) |
 | T21 | pivot_structure | technical | 結構 | ✅ |
 | C01 | big_holder_slope | chips | 集保 | (併入 C05) |

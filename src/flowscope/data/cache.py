@@ -52,6 +52,7 @@ class ParquetCache:
         no_cache: bool,
         today: date | None = None,
         immutable_after: date | None = None,
+        cache_empty: bool = False,
     ) -> pl.DataFrame:
         path = self.path_for(key)
         if not no_cache and path.is_file() and self._is_valid(
@@ -63,7 +64,7 @@ class ParquetCache:
             return pl.read_parquet(path)
 
         df = fetch()
-        if df.is_empty():
+        if df.is_empty() and not cache_empty:
             raise ValueError(f"Refusing to cache an empty result for {key.provider}.{key.method}")
         path.parent.mkdir(parents=True, exist_ok=True)
         df.write_parquet(path)

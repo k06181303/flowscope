@@ -8,6 +8,7 @@ import polars as pl
 
 from flowscope.config.schema import L0GateConfig, L1GateConfig
 from flowscope.data.calendar import TradingCalendar
+from flowscope.data.price_quality import PRICE_ACTIVITY_COLUMNS, is_invalid_price_row
 
 TWSE_NONMANUFACTURING_INDUSTRY_CODES = frozenset(
     {
@@ -123,7 +124,11 @@ def apply_l0_gates(
         },
         "listings",
     )
-    ensure_columns(prices, {"symbol", "data_date", "close", "amount"}, "prices")
+    ensure_columns(
+        prices,
+        {"symbol", "data_date", *PRICE_ACTIVITY_COLUMNS},
+        "prices",
+    )
 
     latest_trade_date = calendar.on_or_before(as_of)
     trailing_dates = calendar.trailing_dates(latest_trade_date, 20)
@@ -267,7 +272,10 @@ def price_metrics(
         trailing.group_by("symbol")
         .agg(
             pl.col("amount").mean().alias("avg_20d_dollar_volume"),
-            pl.col("data_date").n_unique().alias("trading_days_with_price_20d"),
+            pl.col("data_date")
+            .filter(~is_invalid_price_row())
+            .n_unique()
+            .alias("trading_days_with_price_20d"),
         )
         .with_columns(
             (pl.col("trading_days_with_price_20d") / len(trailing_dates)).alias(

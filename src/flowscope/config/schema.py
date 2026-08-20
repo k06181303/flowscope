@@ -122,6 +122,63 @@ class FactorGroupConfig(StrictModel):
 
 class TechnicalFactorGroupConfig(FactorGroupConfig):
     allowed_factor_ids: ClassVar[frozenset[str]] = TECHNICAL_FACTOR_IDS
+    diagnostic_params: dict[str, dict[str, Any]]
+    factor_priority: list[str]
+
+    @model_validator(mode="after")
+    def validate_enabled_params_exist(self) -> TechnicalFactorGroupConfig:
+        missing = sorted(set(self.enabled) - set(self.params))
+        if missing:
+            raise ValueError(f"enabled technical factors missing params: {', '.join(missing)}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_diagnostic_config(self) -> TechnicalFactorGroupConfig:
+        diagnostic_ids = set(self.diagnostic_params)
+        enabled_ids = set(self.enabled)
+        overlap = sorted(diagnostic_ids & enabled_ids)
+        if overlap:
+            raise ValueError(
+                "technical diagnostic_params must contain only disabled factors: "
+                f"{', '.join(overlap)}"
+            )
+        unknown_diagnostic_ids = sorted(diagnostic_ids - self.allowed_factor_ids)
+        if unknown_diagnostic_ids:
+            raise ValueError(
+                "technical diagnostic_params contain unknown IDs: "
+                f"{', '.join(unknown_diagnostic_ids)}"
+            )
+        missing_diagnostic_ids = sorted(
+            self.allowed_factor_ids - enabled_ids - diagnostic_ids
+        )
+        if missing_diagnostic_ids:
+            raise ValueError(
+                "technical diagnostics missing params: "
+                f"{', '.join(missing_diagnostic_ids)}"
+            )
+
+        priority_counts = Counter(self.factor_priority)
+        duplicate_priorities = sorted(
+            factor_id for factor_id, count in priority_counts.items() if count > 1
+        )
+        if duplicate_priorities:
+            raise ValueError(
+                "technical factor_priority contains duplicate IDs: "
+                f"{', '.join(duplicate_priorities)}"
+            )
+        missing_priorities = sorted(self.allowed_factor_ids - set(self.factor_priority))
+        unknown_priorities = sorted(set(self.factor_priority) - self.allowed_factor_ids)
+        if missing_priorities or unknown_priorities:
+            raise ValueError(
+                "technical factor_priority must contain every T01-T21 ID exactly once: "
+                f"missing={', '.join(missing_priorities) or 'none'}, "
+                f"unknown={', '.join(unknown_priorities) or 'none'}"
+            )
+        return self
+
+    @property
+    def all_params(self) -> dict[str, dict[str, Any]]:
+        return {**self.params, **self.diagnostic_params}
 
 
 class ChipsFactorGroupConfig(FactorGroupConfig):

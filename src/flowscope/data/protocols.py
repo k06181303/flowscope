@@ -16,6 +16,17 @@ class PriceProvider(Protocol):
     ) -> pl.DataFrame:
         """Return symbol, data_date, publish_date, OHLCV, amount, shares_outstanding."""
 
+    def get_benchmark_history(self, start: date, end: date) -> pl.DataFrame:
+        """Return TAIEX total-return index with publish_date."""
+
+    def get_adjusted_price_history(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        """Return PIT-safe backward-adjusted OHLCV without share enrichment."""
+
 
 class ChipProvider(Protocol):
     def get_institutional_flow(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:

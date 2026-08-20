@@ -37,12 +37,13 @@ PER_SYMBOL_DATASETS = frozenset(
         "TaiwanStockFinancialStatements",
         "TaiwanStockBalanceSheet",
         "TaiwanStockCashFlowsStatement",
-        "TaiwanStockDividendResult",
         "TaiwanStockMonthRevenue",
     }
 )
 TDCC_HOLDER_DATASET = "TaiwanStockHoldingSharesPer"
 TDCC_SHARE_PCT_TOLERANCE = 0.5
+CALENDAR_GUARD_DAYS = 14
+MAX_CONSECUTIVE_EMERGENCY_CLOSURE_DAYS = 2
 
 
 class FinMindRowsClient(Protocol):
@@ -64,6 +65,14 @@ class FinMindRequest:
     data_id: str | None
     start: date | None
     end: date | None
+
+
+@dataclass(frozen=True)
+class DataQualityEvent:
+    code: str
+    source: str
+    data_date: date
+    message: str
 
 
 class FinMindClient:
@@ -152,6 +161,15 @@ class FinMindProvider:
         self._cache = ParquetCache(data_root / "raw")
         self._tdcc_raw_root = data_root / "raw" / "tdcc"
         self._client = client or FinMindClient(token or load_finmind_token())
+        self._prefetched_price_rows: dict[date, list[dict[str, Any]]] = {}
+        self._trading_calendar_memory: dict[tuple[date, date], TradingCalendar] = {}
+        self._data_quality_events: dict[tuple[str, date], DataQualityEvent] = {}
+
+    @property
+    def data_quality_events(self) -> tuple[DataQualityEvent, ...]:
+        return tuple(
+            self._data_quality_events[key] for key in sorted(self._data_quality_events)
+        )
 
     def get_ohlcv(
         self,
@@ -183,6 +201,40 @@ class FinMindProvider:
 
         return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
 
+    def get_benchmark_history(self, start: date, end: date) -> pl.DataFrame:
+        key = cache_key("get_benchmark_history", ["TAIEX"], start, end)
+
+        def fetch() -> pl.DataFrame:
+            rows = self._fetch_dataset("TaiwanStockTotalReturnIndex", "TAIEX", start, end)
+            return (
+                frame_from_rows(rows)
+                .with_columns(
+                    pl.col("date").str.strptime(pl.Date).alias("data_date"),
+                    pl.col("price").cast(pl.Float64).alias("benchmark_close"),
+                )
+                .with_columns(pl.col("data_date").alias("publish_date"))
+                .select("data_date", "publish_date", "benchmark_close")
+                .sort("data_date")
+            )
+
+        return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+
+    def get_adjusted_price_history(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        validate_symbols(symbols)
+        key = cache_key("get_adjusted_price_history", symbols, start, end)
+
+        def fetch() -> pl.DataFrame:
+            raw = self.get_price_history(symbols, start, end)
+            dividends = self._get_dividend_result_frame(symbols, start, end)
+            return backward_adjust_ohlcv(raw, dividends, end)
+
+        return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
+
     def get_market_values(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         validate_symbols(symbols)
         key = cache_key("get_market_values", symbols, start, end)
@@ -204,14 +256,112 @@ class FinMindProvider:
         return as_of_filter(self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache), end)
 
     def get_trading_calendar(self, start: date, end: date) -> TradingCalendar:
-        key = cache_key("get_trading_calendar", ["ALL"], start, end)
+        memory_key = (start, end)
+        if memory_key in self._trading_calendar_memory:
+            return self._trading_calendar_memory[memory_key]
+        key = cache_key("get_actual_trading_calendar_v2", ["ALL"], start, end)
 
         def fetch() -> pl.DataFrame:
-            rows = self._fetch_dataset("TaiwanStockTradingDate", None, start, end)
-            return frame_from_rows(rows).select(pl.col("date").str.strptime(pl.Date).alias("date"))
+            guard_start = start - timedelta(days=CALENDAR_GUARD_DAYS)
+            guard_end = end + timedelta(days=CALENDAR_GUARD_DAYS)
+            rows = self._fetch_dataset(
+                "TaiwanStockTradingDate",
+                None,
+                guard_start,
+                guard_end,
+            )
+            candidates = sorted(
+                {
+                    date.fromisoformat(str(row["date"]))
+                    for row in rows
+                    if guard_start <= date.fromisoformat(str(row["date"])) <= guard_end
+                }
+            )
+            requested_candidates = [day for day in candidates if start <= day <= end]
+            if not requested_candidates:
+                raise FinMindError(
+                    f"TaiwanStockTradingDate returned no dates for {start}..{end}"
+                )
+
+            actual_dates: list[date] = []
+            for candidate in requested_candidates:
+                price_rows = self._get_daily_market_price_rows(candidate, allow_empty=True)
+                self._prefetched_price_rows[candidate] = price_rows
+                if price_rows:
+                    actual_dates.append(candidate)
+
+            missing_candidates = [
+                candidate for candidate in requested_candidates if candidate not in actual_dates
+            ]
+            needs_guard_rows = any(
+                not any(day < candidate for day in actual_dates)
+                or not any(day > candidate for day in actual_dates)
+                for candidate in missing_candidates
+            )
+            if needs_guard_rows:
+                for candidate in candidates:
+                    if candidate in requested_candidates:
+                        continue
+                    price_rows = self._get_daily_market_price_rows(candidate, allow_empty=True)
+                    self._prefetched_price_rows[candidate] = price_rows
+                    if price_rows:
+                        actual_dates.append(candidate)
+                actual_dates.sort()
+
+            actual_set = set(actual_dates)
+            longest_empty_run = longest_consecutive_missing_dates(
+                requested_candidates,
+                actual_set,
+            )
+            if longest_empty_run > MAX_CONSECUTIVE_EMERGENCY_CLOSURE_DAYS:
+                raise FinMindError(
+                    "TaiwanStockPrice has too many consecutive successful empty candidate "
+                    f"dates: {longest_empty_run} > "
+                    f"{MAX_CONSECUTIVE_EMERGENCY_CLOSURE_DAYS}; treating this as a data "
+                    "failure, not emergency market closures"
+                )
+            for candidate in requested_candidates:
+                if candidate in actual_set:
+                    continue
+                has_previous_market_day = any(day < candidate for day in actual_dates)
+                has_next_market_day = any(day > candidate for day in actual_dates)
+                if not has_previous_market_day or not has_next_market_day:
+                    raise FinMindError(
+                        "Cannot distinguish an emergency market closure from a FinMind data "
+                        f"failure for {candidate.isoformat()}: successful market-price dates "
+                        "are required on both sides"
+                    )
+                message = (
+                    f"{candidate.isoformat()} is listed by TaiwanStockTradingDate but has no "
+                    "full-market TaiwanStockPrice rows; recording it as an emergency closure"
+                )
+                self._data_quality_events[("emergency_market_closure", candidate)] = (
+                    DataQualityEvent(
+                        code="emergency_market_closure",
+                        source="FinMind:TaiwanStockTradingDate+TaiwanStockPrice",
+                        data_date=candidate,
+                        message=message,
+                    )
+                )
+                warnings.warn(
+                    message,
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+            requested_actual_dates = [
+                candidate for candidate in requested_candidates if candidate in actual_set
+            ]
+            if not requested_actual_dates:
+                raise FinMindError(
+                    f"No actual TaiwanStockPrice trading dates for {start}..{end}"
+                )
+            return pl.DataFrame({"date": requested_actual_dates}, schema={"date": pl.Date})
 
         df = self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache)
-        return TradingCalendar.from_frame(df)
+        calendar = TradingCalendar.from_frame(df)
+        self._trading_calendar_memory[memory_key] = calendar
+        return calendar
 
     def get_institutional_flow(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         validate_symbols(symbols)
@@ -458,13 +608,16 @@ class FinMindProvider:
         start: date,
         end: date,
     ) -> pl.DataFrame:
-        dividend_start = start - timedelta(days=370)
-        rows = self._fetch_dataset_for_symbols(
-            "TaiwanStockDividendResult",
-            symbols,
-            dividend_start,
-            end,
-        )
+        rows = self._fetch_daily_dividend_rows(symbols, start, end)
+        if not rows:
+            return pl.DataFrame(
+                schema={
+                    "symbol": pl.Utf8,
+                    "data_date": pl.Date,
+                    "before_price": pl.Float64,
+                    "after_price": pl.Float64,
+                }
+            )
         return (
             frame_from_rows(rows)
             .with_columns(
@@ -476,6 +629,68 @@ class FinMindProvider:
             .select("symbol", "data_date", "before_price", "after_price")
             .sort(["symbol", "data_date"])
         )
+
+    def _fetch_daily_dividend_rows(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> list[dict[str, Any]]:
+        wanted = set(symbols)
+        rows: list[dict[str, Any]] = []
+        for trading_date in self._trading_dates(start, end):
+            price_rows = self._get_daily_market_price_rows(trading_date, allow_empty=False)
+            if not price_rows:
+                raise FinMindError(
+                    "Cannot classify an empty daily dividend event list without full-market "
+                    f"prices for {trading_date.isoformat()}"
+                )
+            dividend_rows = self._get_daily_market_dividend_rows(trading_date)
+            rows.extend(
+                row for row in dividend_rows if str(row.get("stock_id")) in wanted
+            )
+        return rows
+
+    def _get_daily_market_dividend_rows(self, trading_date: date) -> list[dict[str, Any]]:
+        key = cache_key(
+            "daily_bulk_TaiwanStockDividendResult",
+            ["ALL"],
+            trading_date,
+            trading_date,
+        )
+
+        def fetch() -> pl.DataFrame:
+            rows = self._fetch_dataset_allow_empty(
+                "TaiwanStockDividendResult",
+                None,
+                trading_date,
+                trading_date,
+            )
+            if not rows:
+                return pl.DataFrame(
+                    schema={
+                        "date": pl.Utf8,
+                        "stock_id": pl.Utf8,
+                        "before_price": pl.Float64,
+                        "after_price": pl.Float64,
+                    }
+                )
+            returned_dates = {date.fromisoformat(str(row["date"])) for row in rows}
+            if returned_dates != {trading_date}:
+                raise FinMindError(
+                    "TaiwanStockDividendResult full-market daily request returned "
+                    f"unexpected dates: requested={trading_date.isoformat()}, "
+                    f"returned={format_dates(sorted(returned_dates))}"
+                )
+            return pl.DataFrame(rows)
+
+        frame = self._cache.get_or_fetch(
+            key,
+            fetch,
+            no_cache=self._no_cache,
+            cache_empty=True,
+        )
+        return frame.to_dicts()
 
     def _attach_shares_outstanding(
         self,
@@ -604,7 +819,15 @@ class FinMindProvider:
         requested_dates = self._trading_dates(start, end)
         rows: list[dict[str, Any]] = []
         for trading_date in requested_dates:
-            rows.extend(self._fetch_dataset(dataset, None, trading_date, trading_date))
+            if dataset == "TaiwanStockPrice":
+                prefetched = self._prefetched_price_rows.pop(trading_date, None)
+                rows.extend(
+                    prefetched
+                    if prefetched is not None
+                    else self._get_daily_market_price_rows(trading_date, allow_empty=False)
+                )
+            else:
+                rows.extend(self._fetch_dataset(dataset, None, trading_date, trading_date))
         returned_dates = {
             date.fromisoformat(str(row["date"]))
             for row in rows
@@ -754,11 +977,71 @@ class FinMindProvider:
         return publish_dates
 
     def _trading_dates(self, start: date, end: date) -> tuple[date, ...]:
-        rows = self._fetch_dataset("TaiwanStockTradingDate", None, start, end)
-        dates = tuple(date.fromisoformat(str(row["date"])) for row in rows)
-        if not dates:
-            raise FinMindError(f"TaiwanStockTradingDate returned no dates for {start}..{end}")
-        return dates
+        return self.get_trading_calendar(start, end).dates
+
+    def _get_daily_market_price_rows(
+        self,
+        trading_date: date,
+        *,
+        allow_empty: bool,
+    ) -> list[dict[str, Any]]:
+        key = cache_key(
+            "daily_bulk_TaiwanStockPrice",
+            ["ALL"],
+            trading_date,
+            trading_date,
+        )
+
+        def fetch() -> pl.DataFrame:
+            rows = self._fetch_dataset_allow_empty(
+                "TaiwanStockPrice",
+                None,
+                trading_date,
+                trading_date,
+            )
+            if not rows:
+                raise _EmptySuccessfulResponse
+            returned_dates = {date.fromisoformat(str(row["date"])) for row in rows}
+            if returned_dates != {trading_date}:
+                raise FinMindError(
+                    "TaiwanStockPrice full-market request returned unexpected dates: "
+                    f"requested={trading_date.isoformat()}, "
+                    f"returned={format_dates(sorted(returned_dates))}"
+                )
+            return frame_from_rows(rows)
+
+        try:
+            frame = self._cache.get_or_fetch(key, fetch, no_cache=self._no_cache)
+        except _EmptySuccessfulResponse:
+            if allow_empty:
+                return []
+            raise FinMindError(
+                f"TaiwanStockPrice returned no rows for {trading_date.isoformat()}"
+            ) from None
+        return frame.to_dicts()
+
+    def _fetch_dataset_allow_empty(
+        self,
+        dataset: str,
+        data_id: str | None,
+        start: date | None,
+        end: date | None,
+    ) -> list[dict[str, Any]]:
+        request = FinMindRequest(dataset, data_id, start, end)
+        try:
+            if isinstance(self._client, FinMindPayloadClient):
+                return extract_rows(
+                    self._client.fetch_payload(request),
+                    dataset,
+                    allow_empty=True,
+                )
+            return self._client.fetch_rows(request)
+        except FinMindError as exc:
+            raise FinMindError(
+                f"{dataset} request failed: data_id={data_id or 'ALL'}, "
+                f"start={start.isoformat() if start is not None else 'none'}, "
+                f"end={end.isoformat() if end is not None else 'none'}: {exc}"
+            ) from exc
 
     def _fetch_dataset(
         self,
@@ -816,7 +1099,12 @@ def frame_from_rows(rows: list[dict[str, Any]]) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
-def extract_rows(payload: object, dataset: str) -> list[dict[str, Any]]:
+def extract_rows(
+    payload: object,
+    dataset: str,
+    *,
+    allow_empty: bool = False,
+) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         raise FinMindError(f"{dataset} returned a non-object payload")
     msg = str(payload.get("msg", ""))
@@ -826,11 +1114,34 @@ def extract_rows(payload: object, dataset: str) -> list[dict[str, Any]]:
     if any(term in lowered for term in ("limit", "too many requests", "rate")):
         raise FinMindError(f"{dataset} rate limited: {msg}")
     rows = payload.get("data")
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list):
+        raise FinMindError(f"{dataset} returned no rows")
+    if not rows:
+        if allow_empty:
+            return []
         raise FinMindError(f"{dataset} returned no rows")
     if not all(isinstance(row, dict) for row in rows):
         raise FinMindError(f"{dataset} returned malformed rows")
     return rows
+
+
+class _EmptySuccessfulResponse(RuntimeError):
+    """標記 FinMind 明確成功但資料列為零的回應。"""
+
+
+def longest_consecutive_missing_dates(
+    candidates: list[date],
+    actual_dates: set[date],
+) -> int:
+    longest = 0
+    current = 0
+    for candidate in candidates:
+        if candidate in actual_dates:
+            current = 0
+            continue
+        current += 1
+        longest = max(longest, current)
+    return longest
 
 
 def parse_holding_level(label: str, row: dict[str, object]) -> int | None:

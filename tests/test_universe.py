@@ -18,6 +18,7 @@ from flowscope.universe.gates import (
     apply_l1_gates,
     is_nonmanufacturing_industry,
     latest_financials,
+    price_metrics,
 )
 
 
@@ -65,6 +66,48 @@ def test_l0_gates_are_applied_in_spec_order() -> None:
         ("L0 market", 2, 1),
     ]
     assert result.frame["symbol"].to_list() == ["A"]
+
+
+def test_l0_trading_day_ratio_excludes_complete_zero_price_rows() -> None:
+    days = tuple(date(2024, 1, 1) + timedelta(days=index) for index in range(10))
+    rows = price_rows("A", days, 20.0, 1_000_000_000.0)
+    for index in (1, 4, 7):
+        rows[index].update(
+            open=0.0,
+            high=0.0,
+            low=0.0,
+            close=0.0,
+            volume=0.0,
+            amount=0.0,
+        )
+
+    metrics = price_metrics(pl.DataFrame(rows), days, days[-1]).row(0, named=True)
+
+    assert metrics["trading_days_with_price_20d"] == 7
+    assert metrics["trading_day_ratio_20d"] == pytest.approx(0.7)
+    # 原始 0 成交金額仍納入平均，維持保守的流動性估計。
+    assert metrics["avg_20d_dollar_volume"] == pytest.approx(700_000_000.0)
+
+
+def test_l0_trading_day_ratio_excludes_odd_lot_only_rows_but_keeps_amount() -> None:
+    days = tuple(date(2024, 1, 1) + timedelta(days=index) for index in range(10))
+    rows = price_rows("A", days, 20.0, 1_000_000_000.0)
+    for index in (1, 4, 7):
+        rows[index].update(
+            open=0.0,
+            high=0.0,
+            low=0.0,
+            close=0.0,
+            volume=3.0,
+            amount=74.0,
+        )
+
+    metrics = price_metrics(pl.DataFrame(rows), days, days[-1]).row(0, named=True)
+
+    assert metrics["trading_days_with_price_20d"] == 7
+    assert metrics["trading_day_ratio_20d"] == pytest.approx(0.7)
+    # 零股量額保留在平均中；剔除整列會不誠實地放寬流動性 gate。
+    assert metrics["avg_20d_dollar_volume"] == pytest.approx(700_000_022.2)
 
 
 def test_l1_altman_uses_manufacturing_and_nonmanufacturing_models() -> None:
@@ -404,7 +447,11 @@ def price_rows(
             "symbol": symbol,
             "data_date": day,
             "publish_date": day,
+            "open": close,
+            "high": close,
+            "low": close,
             "close": close,
+            "volume": amount / close,
             "amount": amount,
         }
         for day in days

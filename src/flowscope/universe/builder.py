@@ -60,6 +60,42 @@ class UniverseFunnel:
         return [str(symbol) for symbol in self.l1.frame["symbol"].head(self.final_count)]
 
 
+@dataclass(frozen=True)
+class L0Universe:
+    latest_trade_date: date
+    calendar: TradingCalendar
+    initial_count: int
+    application: GateApplication
+
+
+def build_l0_universe(
+    config: FlowScopeConfig,
+    as_of: date,
+    data_provider: PriceDataProvider,
+    market_provider: MarketMetaProvider,
+) -> L0Universe:
+    calendar_start = as_of - timedelta(days=LISTING_DAY_LOOKBACK_CALENDAR_DAYS)
+    calendar = data_provider.get_trading_calendar(calendar_start, as_of)
+    latest_trade_date = calendar.on_or_before(as_of)
+    listings = market_provider.get_listings(latest_trade_date)
+    trailing_dates = calendar.trailing_dates(latest_trade_date, 20)
+    symbols = [str(symbol) for symbol in listings["symbol"]]
+    prices = data_provider.get_price_history(symbols, trailing_dates[0], latest_trade_date)
+    application = apply_l0_gates(
+        listings,
+        prices,
+        calendar,
+        latest_trade_date,
+        config.gates.l0,
+    )
+    return L0Universe(
+        latest_trade_date=latest_trade_date,
+        calendar=calendar,
+        initial_count=listings.height,
+        application=application,
+    )
+
+
 def build_universe_funnel(
     config: FlowScopeConfig,
     as_of: date,
@@ -83,16 +119,14 @@ def build_universe_funnel(
             f"as_of={as_of.isoformat()}"
         )
 
-    calendar_start = requested_price_as_of - timedelta(days=LISTING_DAY_LOOKBACK_CALENDAR_DAYS)
-    calendar = data_provider.get_trading_calendar(calendar_start, requested_price_as_of)
-    latest_trade_date = calendar.on_or_before(requested_price_as_of)
-    listings = market_provider.get_listings(latest_trade_date)
-    trailing_dates = calendar.trailing_dates(latest_trade_date, 20)
-    price_start = trailing_dates[0]
-
-    symbols = [str(symbol) for symbol in listings["symbol"]]
-    prices = data_provider.get_price_history(symbols, price_start, latest_trade_date)
-    l0 = apply_l0_gates(listings, prices, calendar, latest_trade_date, config.gates.l0)
+    l0_universe = build_l0_universe(
+        config,
+        requested_price_as_of,
+        data_provider,
+        market_provider,
+    )
+    latest_trade_date = l0_universe.latest_trade_date
+    l0 = l0_universe.application
 
     l0_symbols = [str(symbol) for symbol in l0.frame["symbol"]]
     warnings = market_provider.get_warnings(resolved_warnings_snapshot)
@@ -116,7 +150,7 @@ def build_universe_funnel(
         price_as_of=latest_trade_date,
         warnings_snapshot=resolved_warnings_snapshot,
         market=config.market,
-        initial_count=listings.height,
+        initial_count=l0_universe.initial_count,
         l0=l0,
         l1=l1,
         top_n=config.universe.top_n,

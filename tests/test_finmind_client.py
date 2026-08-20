@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from flowscope.data.providers.finmind import FinMindClient, FinMindError, FinMindRequest
+from flowscope.data.providers.finmind import (
+    FinMindClient,
+    FinMindError,
+    FinMindRequest,
+    extract_rows,
+)
 
 
 class Response:
@@ -57,6 +62,16 @@ def test_finmind_client_rejects_empty_data(monkeypatch: pytest.MonkeyPatch) -> N
 
     with pytest.raises(FinMindError, match="returned no rows"):
         client.fetch_rows(FinMindRequest("TaiwanStockPrice", "2330", None, None))
+
+
+def test_extract_rows_allows_explicitly_empty_success_for_calendar_probe() -> None:
+    rows = extract_rows(
+        {"msg": "success", "data": []},
+        "TaiwanStockPrice",
+        allow_empty=True,
+    )
+
+    assert rows == []
 
 
 def test_finmind_client_retries_transient_http_error(monkeypatch: pytest.MonkeyPatch) -> None:

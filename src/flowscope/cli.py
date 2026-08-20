@@ -4,12 +4,23 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
 from flowscope.config.loader import load_config_with_hash
+from flowscope.config.schema import FlowScopeConfig
 from flowscope.data.providers.finmind import FinMindError, FinMindProvider
 from flowscope.data.providers.twse import OfficialMarketDataError, OfficialMarketProvider
-from flowscope.universe.builder import build_universe_funnel, render_funnel
+from flowscope.factors.diagnostics import (
+    correlation_pair_details,
+    render_spearman_report,
+    spearman_matrix,
+)
+from flowscope.factors.technical import (
+    TECHNICAL_FACTORS,
+    compute_technical_factor_history,
+)
+from flowscope.universe.builder import build_l0_universe, build_universe_funnel, render_funnel
 from flowscope.universe.gates import UniverseGateError
 
 app = typer.Typer(
@@ -148,9 +159,147 @@ def data_validate() -> None:
 def collinearity(
     market: Annotated[str, typer.Option("--market", help="Market code.")],
     horizon: Annotated[str, typer.Option("--horizon", help="Selection horizon.")],
+    input_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--input",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Parquet file containing symbol/factor_id/raw_value.",
+        ),
+    ] = None,
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to a FlowScope YAML config.",
+        ),
+    ] = Path("configs/tw_swing.yaml"),
+    as_of: Annotated[
+        str | None,
+        typer.Option("--as-of", help="Point-in-time end date."),
+    ] = None,
+    lookback: Annotated[
+        int,
+        typer.Option("--lookback", min=2, help="Number of trading-day cross-sections."),
+    ] = 250,
+    factor_output: Annotated[
+        Path,
+        typer.Option("--factor-output", help="PIT factor-history Parquet output path."),
+    ] = Path("data/processed/technical_factors.parquet"),
+    csv_output: Annotated[
+        Path,
+        typer.Option("--csv-output", help="Spearman matrix CSV output path."),
+    ] = Path("data/processed/technical_factor_spearman.csv"),
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", min=0.0, max=1.0, help="Absolute rho warning threshold."),
+    ] = 0.7,
+    no_cache: Annotated[
+        bool,
+        typer.Option("--no-cache", help="Bypass local data cache."),
+    ] = False,
 ) -> None:
-    typer.echo(f"market={market}, horizon={horizon}")
-    _step_message("diagnose collinearity")
+    loaded = load_config_with_hash(config)
+    technical = loaded.config.factors.technical
+    if market != loaded.config.market or horizon != loaded.config.horizon:
+        raise typer.BadParameter("--market/--horizon must match the loaded config")
+    try:
+        factors = (
+            pl.read_parquet(input_path)
+            if input_path is not None
+            else build_collinearity_factor_history(
+                loaded.config,
+                _parse_date(as_of, "--as-of") or date.today(),
+                lookback,
+                factor_output,
+                no_cache=no_cache,
+            )
+        )
+        matrix = spearman_matrix(factors)
+        pairs = correlation_pair_details(
+            factors,
+            matrix,
+            threshold,
+            technical.factor_priority,
+        )
+        csv_output.parent.mkdir(parents=True, exist_ok=True)
+        matrix.write_csv(csv_output)
+    except (
+        FinMindError,
+        OfficialMarketDataError,
+        UniverseGateError,
+        OSError,
+        ValueError,
+        pl.exceptions.PolarsError,
+    ) as exc:
+        typer.secho(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(
+        render_spearman_report(
+            matrix,
+            pairs,
+            market=market,
+            horizon=horizon,
+            lookback=lookback,
+            as_of_count=factors["as_of"].n_unique(),
+            symbol_count=factors["symbol"].n_unique(),
+            threshold=threshold,
+        )
+    )
+    typer.echo(f"CSV: {csv_output}")
+
+
+def build_collinearity_factor_history(
+    config: FlowScopeConfig,
+    as_of: date,
+    lookback: int,
+    output_path: Path,
+    *,
+    no_cache: bool,
+) -> pl.DataFrame:
+    provider = FinMindProvider(no_cache=no_cache)
+    l0 = build_l0_universe(config, as_of, provider, OfficialMarketProvider())
+    symbols = [str(symbol) for symbol in l0.application.frame["symbol"]]
+    if not symbols:
+        raise UniverseGateError("L0 universe is empty")
+
+    maximum_history = max(factor.min_history_days for factor in TECHNICAL_FACTORS.values())
+    required_sessions = lookback + maximum_history - 1
+    calendar_start = l0.latest_trade_date - timedelta(days=required_sessions * 2 + 60)
+    calendar = provider.get_trading_calendar(calendar_start, l0.latest_trade_date)
+    history_dates = calendar.trailing_dates(l0.latest_trade_date, required_sessions)
+    if len(history_dates) != required_sessions:
+        raise FinMindError(
+            f"Trading calendar has {len(history_dates)} sessions; "
+            f"collinearity requires {required_sessions}"
+        )
+    as_of_dates = history_dates[-lookback:]
+    prices = provider.get_adjusted_price_history(
+        symbols,
+        history_dates[0],
+        l0.latest_trade_date,
+    )
+    benchmark = provider.get_benchmark_history(
+        history_dates[0],
+        l0.latest_trade_date,
+    ).select("data_date", "benchmark_close")
+    panel = prices.join(benchmark, on="data_date", how="left")
+    factors = compute_technical_factor_history(
+        panel,
+        as_of_dates,
+        sorted(TECHNICAL_FACTORS),
+        config.factors.technical.all_params,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    factors.write_parquet(output_path)
+    return factors
 
 
 @diagnose_app.command()
